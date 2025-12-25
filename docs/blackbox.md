@@ -86,8 +86,6 @@ $$
 
 따라서 외부에서 안정적인 $\nabla_x J(x)$를 직접 계산하는 접근은 일반적으로 실패하거나 매우 불안정하다.
 
----
-
 ### 4. ES(Score Function Estimator)의 유도
 외부 목적함수 $J(x)$가 비미분적이더라도, **평활화(smoothing)** 를 통해 “근사적으로 미분 가능한 목적함수”를 만들 수 있다.
 
@@ -116,11 +114,8 @@ $$
 양변을 $x$로 미분하면
 
 $$
-\nabla_x J_\sigma(x)
-=
-\int J(u)\,\nabla_x p(u\mid x)\,du
-=
-\int J(u)\,p(u\mid x)\,\nabla_x \log p(u\mid x)\,du.
+\nabla_x J_\sigma(x)=\int J(u)\,\nabla_x p(u\mid x)\,du
+=\int J(u)\,p(u\mid x)\,\nabla_x \log p(u\mid x)\,du.
 $$
 
 즉,
@@ -144,20 +139,16 @@ $$
 그런데 $u=x+\sigma\epsilon$이므로 $(u-x)/\sigma^2 = \epsilon/\sigma$. 따라서
 
 $$
-\nabla_x J_\sigma(x)
-=
-\frac{1}{\sigma}\,\mathbb{E}_{\epsilon\sim\mathcal{N}(0,I)}\big[J(x+\sigma\epsilon)\,\epsilon\big]
+\nabla_x J_\sigma(x)=\frac{1}{\sigma}\,\mathbb{E}_{\epsilon\sim\mathcal{N}(0,I)}\big[J(x+\sigma\epsilon)\,\epsilon\big]
 $$
 
 이는 $J$가 미분 불가능하더라도 “함수값 평가”만으로 그라디언트를 근사하는 핵심 공식이다.
 
-#### 4.3 몬테카를로 추정기
+## 4.3 몬테카를로 추정기
 표본 $\epsilon_1,\ldots,\epsilon_K \sim \mathcal{N}(0,I)$를 사용하면
 
 $$
-\widehat{\nabla_x J_\sigma}(x)
- =
- \frac{1}{K\sigma}\sum_{k=1}^{K} J(x+\sigma\epsilon_k)\,\epsilon_k
+\widehat{\nabla_x J_\sigma}(x)=\frac{1}{K\sigma}\sum_{k=1}^{K} J(x+\sigma\epsilon_k)\,\epsilon_k
 $$
 
 로 추정할 수 있다. 분산 감소를 위해 $J(x+\sigma\epsilon_k)$에서 배이스라인(예: 표본 평균)을 빼는 것이 일반적이다.
