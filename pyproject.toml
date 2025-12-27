@@ -1,7 +1,7 @@
 [project]
 name = "lb-igd"
 version = "0.1.0"
-description = "LBIGD: Faction Chess IGD (designable move patterns, unit counts, map size, obstacles)"
+description = "LB-IGD: Laplace–Beltrami Inverse Game Design (Faction Chess: designable pieces + map + obstacles)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

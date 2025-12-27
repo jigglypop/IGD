@@ -10,7 +10,8 @@ def main():
     except Exception:
         pass
 
-    print("LBIGD Started (Faction Chess IGD)")
+    print("LB-IGD Started (Laplace–Beltrami Inverse Game Design)")
+    print("Usage: main.py [--opt] [--slow]")
 
     mode = "opt" if "--opt" in sys.argv else "eval"
     fast = "--slow" not in sys.argv
