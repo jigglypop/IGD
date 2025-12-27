@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from typing import Dict, Any, Tuple
-from src.core.simulation import run_simulation
+from src.core.simulation import run_simulation, run_simulation_all_pairs
 
 def wasserstein_distance_1d(u_values, v_values):
     """
@@ -67,92 +67,169 @@ class DesignOptimizer:
             # 너무 과한 프로세스 생성 방지
             cpu = os.cpu_count() or 1
             self.max_workers = min(4, max(1, cpu // 2))
-
-        # 총 유닛 수(팩션별) 목표: 초기 설계에서 고정
-        def _sum_units(prefix: str) -> int:
-            total = 0
-            for name in ["melee", "ranged", "scout", "tank", "siege"]:
-                k = f"{prefix}_{name}_units"
-                if k in initial_design:
-                    total += int(round(float(initial_design.get(k, 0))))
-            return total
-
-        self.target_units = {
-            "p0": max(1, _sum_units("p0")),
-            "p1": max(1, _sum_units("p1")),
-        }
         
-        # 최적화할 키 목록 (맵/말/사거리/이동거리 중심)
+        # 최적화할 키 목록 (맵/유닛수/패턴/이동/사거리/스탯)
         self.optimizable_keys = [
             "width",
             "height",
+            # 장애물(맵 기하)
+            "obstacle_density",
+            "obstacle_pattern",
             # 유닛 수 (킹은 고정 1개라 제외)
-            "p0_melee_units",
-            "p0_ranged_units",
-            "p0_scout_units",
-            "p0_tank_units",
-            "p0_siege_units",
-            "p1_melee_units",
-            "p1_ranged_units",
-            "p1_scout_units",
-            "p1_tank_units",
-            "p1_siege_units",
-            # 이동거리/사거리 (핵심 밸런스 요소)
-            "p0_melee_move",
-            "p0_ranged_move",
-            "p0_scout_move",
-            "p0_ranged_range",
-            "p1_melee_move",
-            "p1_ranged_move",
-            "p1_scout_move",
-            "p1_ranged_range",
-            "p1_siege_range",
+            "p0_unit0_units",
+            "p0_unit1_units",
+            "p0_unit2_units",
+            "p0_unit3_units",
+            "p0_unit4_units",
+            "p1_unit0_units",
+            "p1_unit1_units",
+            "p1_unit2_units",
+            "p1_unit3_units",
+            "p1_unit4_units",
+            # 이동 패턴 ID (0~11, ES가 탐색)
+            "p0_unit0_pattern",
+            "p0_unit1_pattern",
+            "p0_unit2_pattern",
+            "p0_unit3_pattern",
+            "p0_unit4_pattern",
+            "p1_unit0_pattern",
+            "p1_unit1_pattern",
+            "p1_unit2_pattern",
+            "p1_unit3_pattern",
+            "p1_unit4_pattern",
+            # 공격 패턴 ID (0~12, ES가 탐색)
+            "p0_unit0_attack_pattern",
+            "p0_unit1_attack_pattern",
+            "p0_unit2_attack_pattern",
+            "p0_unit3_attack_pattern",
+            "p0_unit4_attack_pattern",
+            "p1_unit0_attack_pattern",
+            "p1_unit1_attack_pattern",
+            "p1_unit2_attack_pattern",
+            "p1_unit3_attack_pattern",
+            "p1_unit4_attack_pattern",
+            # 이동거리
+            "p0_unit0_move",
+            "p0_unit1_move",
+            "p0_unit2_move",
+            "p1_unit0_move",
+            "p1_unit1_move",
+            "p1_unit2_move",
+            "p1_unit4_move",
+            # 사거리
+            "p0_unit0_range",
+            "p0_unit1_range",
+            "p0_unit2_range",
+            "p0_unit3_range",
+            "p0_unit4_range",
+            "p1_unit0_range",
+            "p1_unit1_range",
+            "p1_unit2_range",
+            "p1_unit3_range",
+            "p1_unit4_range",
             # 스탯
-            "p0_melee_hp",
-            "p0_ranged_hp",
-            "p0_melee_damage",
-            "p0_ranged_damage",
-            "p1_melee_hp",
-            "p1_ranged_hp",
-            "p1_melee_damage",
-            "p1_ranged_damage",
-            "p1_scout_damage",
-            "p1_tank_hp",
-            "p1_siege_damage",
+            "p0_unit0_hp",
+            "p0_unit1_hp",
+            "p0_unit0_damage",
+            "p1_unit0_hp",
+            "p1_unit1_hp",
+            "p1_unit0_damage",
+            "p1_unit1_damage",
+            "p1_unit2_damage",
+            "p1_unit3_hp",
+            "p1_unit4_damage",
         ]
 
     def get_loss(self, stats: Dict) -> float:
-        # 1. 승률 밸런스 손실: (p0_win - 0.5)^2
-        # (evaluation.md: L_win)
-        p0 = float(stats["p0_win_rate"])
-        win_diff = (p0 - 0.5) ** 2
-        # 극단(거의 0%/100%)으로 쏠리는 해를 추가로 벌점 (평가 에피소드가 적을 때도 효과적)
-        blowout_penalty = 0.0
-        if p0 <= 0.05 or p0 >= 0.95:
-            blowout_penalty = 2.0
+        # 다팩션 지원: 모든 팩션 쌍의 승률이 0.5에 가깝도록
+        n_factions = int(stats.get("n_factions", 2))
+        
+        if n_factions > 2 and "win_matrix" in stats:
+            # 다팩션: 모든 쌍의 승률 균형
+            win_matrix = stats["win_matrix"]
+            win_diff_sum = 0.0
+            blowout_count = 0
+            n_pairs = 0
+            
+            for (i, j), win_rate in win_matrix.items():
+                if i < j:  # 중복 방지
+                    win_diff_sum += (win_rate - 0.5) ** 2
+                    if win_rate <= 0.05 or win_rate >= 0.95:
+                        blowout_count += 1
+                    n_pairs += 1
+            
+            win_diff = win_diff_sum / max(1, n_pairs)
+            blowout_penalty = 2.0 * blowout_count
+        else:
+            # 2팩션: 기존 방식 (p0_win_rate가 없으면 0.5로 처리)
+            p0 = float(stats.get("p0_win_rate", 0.5))
+            win_diff = (p0 - 0.5) ** 2
+            blowout_penalty = 0.0
+            if p0 <= 0.05 or p0 >= 0.95:
+                blowout_penalty = 2.0
         
         # 2. 분포 정합 손실: Wasserstein 거리
-        # 목표 분포: 정규분포 N(target_mean, 1.0)에서 샘플링한 것으로 가정
         dist_samples = stats.get("distance_samples", [])
         target_samples = np.random.normal(self.target_dist_mean, 1.0, size=len(dist_samples))
-        # 음수 거리는 0으로 클리핑
         target_samples = np.clip(target_samples, 0, None)
-        
         w2_dist = wasserstein_distance_1d(dist_samples, target_samples)
 
-        # 2-b. 교전이 아예 없으면(거리 샘플 0개) 강한 페널티
+        # 2-b. 교전이 아예 없으면 강한 페널티
         no_engagement_penalty = 0.0
         if len(dist_samples) == 0:
             no_engagement_penalty = 10.0
         
-        # 3. 제약 조건 (퇴화 방지): 무승부를 강하게 페널티
-        # (시간초과/무교전 draw로 수렴하는 경향을 끊기 위함)
+        # 3. 무승부 페널티
         draw_penalty = float(stats["draw_rate"]) * 120.0
         
         # 총 손실
-        # 승률 균형을 우선순위로 더 강하게 당김 (현재는 P0 완승 퇴화가 발생)
         total_loss = win_diff * 40.0 + blowout_penalty + w2_dist * 1.0 + draw_penalty + no_engagement_penalty
         return total_loss
+
+    def get_harmonic_loss(self, stats_pos: Dict, stats_neg: Dict) -> float:
+        """
+        라플라스-벨트라미(Laplace-Beltrami) 정규화:
+        승률 지형의 곡률(Curvature)을 페널티로 부과합니다.
+        P(x+e) + P(x-e) ~ 1.0 (Harmonic condition at P=0.5)
+        """
+        p0_pos = float(stats_pos.get("p0_win_rate", 0.5))
+        p0_neg = float(stats_neg.get("p0_win_rate", 0.5))
+        
+        # 1.0에서 벗어난 정도가 곧 Laplacian의 크기 (2차 미분 근사)
+        curvature = abs((p0_pos + p0_neg) - 1.0)
+        return curvature * 10.0
+
+    def get_lbo_curvature(self, stats_center: Dict, stats_pos: Dict, stats_neg: Dict, eps_norm2: float) -> float:
+        """
+        설계공간에서의 LBO(라플라시안) 근사:
+          ΔP(x) ≈ (P(x+σe) + P(x-σe) - 2P(x)) / (σ^2 ||e||^2)
+
+        - stats_*: 동일 seed(=CRN)로 평가된 통계
+        - eps_norm2: ||e||^2 (epsilon 벡터의 제곱노름)
+        """
+        denom = float(self.sigma * self.sigma) * float(max(1e-6, eps_norm2))
+
+        n_factions = int(stats_center.get("n_factions", 2))
+        if n_factions > 2 and "win_matrix" in stats_center:
+            win_c = stats_center["win_matrix"]
+            win_p = stats_pos["win_matrix"]
+            win_n = stats_neg["win_matrix"]
+            laps = []
+            for (i, j), p_c in win_c.items():
+                if i < j:
+                    p_p = float(win_p.get((i, j), p_c))
+                    p_n = float(win_n.get((i, j), p_c))
+                    lap = (p_p + p_n - 2.0 * float(p_c)) / denom
+                    laps.append(lap)
+            if not laps:
+                return 0.0
+            return float(np.mean(np.abs(np.array(laps, dtype=np.float64))))
+
+        p_c = float(stats_center.get("p0_win_rate", 0.5))
+        p_p = float(stats_pos.get("p0_win_rate", p_c))
+        p_n = float(stats_neg.get("p0_win_rate", p_c))
+        lap = (p_p + p_n - 2.0 * p_c) / denom
+        return float(abs(lap))
 
     def _clamp_design(self, d: Dict[str, float]) -> Dict[str, float]:
         """
@@ -163,134 +240,81 @@ class DesignOptimizer:
         # 맵 크기 (체스보다 크게 유지)
         w = int(round(float(out.get("width", 12))))
         h = int(round(float(out.get("height", 12))))
-        out["width"] = max(10, min(24, w))
-        out["height"] = max(10, min(24, h))
+        w = max(10, min(24, w))
+        h = max(10, min(24, h))
+        # 대칭 배치/장애물 미러링을 단순하게 유지하기 위해 짝수 보드 우선
+        if w % 2 == 1:
+            w = w + 1 if w < 24 else w - 1
+        if h % 2 == 1:
+            h = h + 1 if h < 24 else h - 1
+        out["width"] = int(w)
+        out["height"] = int(h)
 
-        # 유닛 수(타입별): 너무 크면 속도 폭발, 너무 작으면 의미 상실
-        p0_melee = int(round(float(out.get("p0_melee_units", 8))))
-        p0_ranged = int(round(float(out.get("p0_ranged_units", 4))))
-        p0_scout = int(round(float(out.get("p0_scout_units", 2))))
-        p0_tank = int(round(float(out.get("p0_tank_units", 3))))
-        p0_siege = int(round(float(out.get("p0_siege_units", 1))))
+        # 장애물(밀도/패턴)
+        out["obstacle_density"] = float(max(0.0, min(0.35, float(out.get("obstacle_density", 0.0)))))
+        out["obstacle_pattern"] = int(max(0, min(3, int(round(float(out.get("obstacle_pattern", 0)))))))
 
-        p1_melee = int(round(float(out.get("p1_melee_units", 6))))
-        p1_ranged = int(round(float(out.get("p1_ranged_units", 2))))
-        p1_scout = int(round(float(out.get("p1_scout_units", 1))))
-        p1_tank = int(round(float(out.get("p1_tank_units", 2))))
-        p1_siege = int(round(float(out.get("p1_siege_units", 1))))
+        # 유닛 수(타입별): unit0~unit4, 0도 허용 (총합 변동 가능)
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                key = f"{prefix}_unit{i}_units"
+                val = int(round(float(out.get(key, 0))))
+                if prefix == "p0":
+                    out[key] = max(0, min(8, val))
+                else:
+                    out[key] = max(0, min(5, val))
 
-        # 모든 유닛 타입 최소 1개 이상 (0이 되면 밸런스 붕괴)
-        out["p0_melee_units"] = max(1, min(10, p0_melee))
-        out["p0_ranged_units"] = max(1, min(8, p0_ranged))
-        out["p0_scout_units"] = max(1, min(6, p0_scout))
-        out["p0_tank_units"] = max(1, min(6, p0_tank))
-        out["p0_siege_units"] = max(1, min(4, p0_siege))
-        out["p1_melee_units"] = max(1, min(6, p1_melee))
-        out["p1_ranged_units"] = max(1, min(4, p1_ranged))
-        out["p1_scout_units"] = max(1, min(4, p1_scout))
-        out["p1_tank_units"] = max(1, min(4, p1_tank))
-        out["p1_siege_units"] = max(1, min(4, p1_siege))
+        # 킹만 남는 구성을 막기 위해(퇴화 방지), 최소 1개는 유지
+        for prefix in ("p0", "p1"):
+            keys = [f"{prefix}_unit{i}_units" for i in range(5)]
+            total = int(sum(int(out.get(k, 0)) for k in keys))
+            if total <= 0:
+                out[keys[0]] = 1
+        
+        # 이동 패턴 ID (0~11 정수)
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                key = f"{prefix}_unit{i}_pattern"
+                val = int(round(float(out.get(key, 0))))
+                out[key] = max(0, min(11, val))
 
-        # 총 유닛 수를 목표치로 맞추기 (P0=16, P1=10 고정)
-        def fix_total(prefix: str):
-            keys = [f"{prefix}_melee_units", f"{prefix}_ranged_units", f"{prefix}_scout_units", f"{prefix}_tank_units", f"{prefix}_siege_units"]
-            # 모든 유닛 타입 최소 1개 이상
-            if prefix == "p0":
-                mins = {
-                    f"{prefix}_melee_units": 1,
-                    f"{prefix}_ranged_units": 1,
-                    f"{prefix}_scout_units": 1,
-                    f"{prefix}_tank_units": 1,
-                    f"{prefix}_siege_units": 1,
-                }
-                maxs = {
-                    f"{prefix}_melee_units": 10,
-                    f"{prefix}_ranged_units": 8,
-                    f"{prefix}_scout_units": 6,
-                    f"{prefix}_tank_units": 6,
-                    f"{prefix}_siege_units": 4,
-                }
-            else:
-                mins = {
-                    f"{prefix}_melee_units": 1,
-                    f"{prefix}_ranged_units": 1,
-                    f"{prefix}_scout_units": 1,
-                    f"{prefix}_tank_units": 1,
-                    f"{prefix}_siege_units": 1,
-                }
-                maxs = {
-                    f"{prefix}_melee_units": 6,
-                    f"{prefix}_ranged_units": 4,
-                    f"{prefix}_scout_units": 4,
-                    f"{prefix}_tank_units": 4,
-                    f"{prefix}_siege_units": 4,
-                }
+        # 공격 패턴 ID (0~12 정수). 기본은 이동 패턴을 따르도록 한다.
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                move_key = f"{prefix}_unit{i}_pattern"
+                atk_key = f"{prefix}_unit{i}_attack_pattern"
+                if atk_key not in out:
+                    out[atk_key] = int(out.get(move_key, 0))
+                val = int(round(float(out.get(atk_key, 0))))
+                out[atk_key] = max(0, min(12, val))
 
-            target = int(self.target_units[prefix])
-            total = int(sum(int(out[k]) for k in keys))
-            if total == target:
-                return
-
-            # 우선순위: melee -> ranged -> scout -> tank -> siege (기본 전투 성립을 위해 melee/ranged 유지)
-            order = keys
-
-            # 줄이기
-            while total > target:
-                changed = False
-                for k in reversed(order):  # siege/tank/scout/ranged/melee 순으로 먼저 깎기
-                    if int(out[k]) > int(mins[k]):
-                        out[k] = int(out[k]) - 1
-                        total -= 1
-                        changed = True
-                        if total == target:
-                            return
-                if not changed:
-                    return
-
-            # 늘리기
-            while total < target:
-                changed = False
-                for k in order:  # melee/ranged/scout/tank/siege 순으로 채우기
-                    if int(out[k]) < int(maxs[k]):
-                        out[k] = int(out[k]) + 1
-                        total += 1
-                        changed = True
-                        if total == target:
-                            return
-                if not changed:
-                    return
-
-        fix_total("p0")
-        fix_total("p1")
-
-        # 이동/사거리 (타입별 일부만 최적화 키로 사용)
-        for k, lo, hi in [
-            ("p0_melee_move", 1.0, 4.0),
-            ("p1_melee_move", 1.0, 4.0),
-            ("p0_ranged_range", 1.0, 6.0),
-            ("p1_ranged_range", 1.0, 6.0),
-        ]:
-            out[k] = float(max(lo, min(hi, float(out.get(k, lo)))))
-
-        # P1 파워 노브 (HP/데미지): 폭주/0으로 붕괴 방지
-        for k, lo, hi in [
-            ("p1_melee_hp", 1.0, 10.0),
-            ("p1_ranged_hp", 1.0, 10.0),
-            ("p1_melee_damage", 0.5, 2.5),
-            ("p1_ranged_damage", 0.5, 2.5),
-        ]:
-            if k in out:
-                out[k] = float(max(lo, min(hi, float(out.get(k, lo)))))
-
-        # P0 파워 노브 (HP/데미지): P0가 너무 강한 쪽으로 고정되는 것을 막기 위해
-        for k, lo, hi in [
-            ("p0_melee_hp", 1.0, 10.0),
-            ("p0_ranged_hp", 1.0, 10.0),
-            ("p0_melee_damage", 0.5, 2.5),
-            ("p0_ranged_damage", 0.5, 2.5),
-        ]:
-            if k in out:
-                out[k] = float(max(lo, min(hi, float(out.get(k, lo)))))
+        # 이동 거리 (unit0~unit4)
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                key = f"{prefix}_unit{i}_move"
+                if key in out:
+                    out[key] = float(max(1.0, min(5.0, float(out.get(key, 1.0)))))
+        
+        # 사거리 (unit0~unit4)
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                key = f"{prefix}_unit{i}_range"
+                if key in out:
+                    out[key] = float(max(1.0, min(8.0, float(out.get(key, 1.0)))))
+        
+        # HP (unit0~unit4)
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                key = f"{prefix}_unit{i}_hp"
+                if key in out:
+                    out[key] = float(max(1.0, min(10.0, float(out.get(key, 2.0)))))
+        
+        # 데미지 (unit0~unit4)
+        for prefix in ("p0", "p1"):
+            for i in range(5):
+                key = f"{prefix}_unit{i}_damage"
+                if key in out:
+                    out[key] = float(max(0.5, min(3.0, float(out.get(key, 1.0)))))
 
         # 에피소드 길이(너무 길면 속도 폭발)
         out["max_steps"] = int(max(60, min(200, int(round(float(out.get("max_steps", 120)))))))
@@ -298,9 +322,36 @@ class DesignOptimizer:
         return out
 
     def _eval_pair(self, design_pos: Dict[str, float], design_neg: Dict[str, float], seed: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        stats_pos = run_simulation(design_pos, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
-        stats_neg = run_simulation(design_neg, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+        # 다팩션이면 all_pairs, 아니면 기존 방식
+        n_factions = int(design_pos.get("n_factions", 2))
+        if n_factions > 2:
+            stats_pos = run_simulation_all_pairs(design_pos, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+            stats_neg = run_simulation_all_pairs(design_neg, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+        else:
+            stats_pos = run_simulation(design_pos, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+            stats_neg = run_simulation(design_neg, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
         return stats_pos, stats_neg
+
+    def _eval_triplet(
+        self,
+        design_center: Dict[str, float],
+        design_pos: Dict[str, float],
+        design_neg: Dict[str, float],
+        seed: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """
+        동일 seed(CRN)에서 center/pos/neg를 함께 평가하여, 설계공간 LBO(2차차분)를 계산할 수 있게 한다.
+        """
+        n_factions = int(design_center.get("n_factions", 2))
+        if n_factions > 2:
+            stats_c = run_simulation_all_pairs(design_center, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+            stats_p = run_simulation_all_pairs(design_pos, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+            stats_n = run_simulation_all_pairs(design_neg, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+        else:
+            stats_c = run_simulation(design_center, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+            stats_p = run_simulation(design_pos, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+            stats_n = run_simulation(design_neg, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
+        return stats_c, stats_p, stats_n
 
     def step(self, step_index: int = 0):
         # ES (Score Function Estimator)
@@ -320,8 +371,10 @@ class DesignOptimizer:
             design_pos = self.mean_design.copy()
             design_neg = self.mean_design.copy()
             for k in self.optimizable_keys:
-                design_pos[k] = max(0.1, float(design_pos[k]) + self.sigma * epsilon[k])
-                design_neg[k] = max(0.1, float(design_neg[k]) - self.sigma * epsilon[k])
+                base_p = float(design_pos.get(k, 0.0))
+                base_n = float(design_neg.get(k, 0.0))
+                design_pos[k] = base_p + self.sigma * epsilon[k]
+                design_neg[k] = base_n - self.sigma * epsilon[k]
 
             # 정수/범위 클램프
             design_pos = self._clamp_design(design_pos)
@@ -337,21 +390,29 @@ class DesignOptimizer:
         def _serial_eval():
             out = []
             for i, dpos, dneg, seed in pairs:
-                stats_pos, stats_neg = self._eval_pair(dpos, dneg, seed)
-                out.append((i, stats_pos, stats_neg))
+                stats_c, stats_pos, stats_neg = self._eval_triplet(self.mean_design, dpos, dneg, seed)
+                out.append((i, stats_c, stats_pos, stats_neg))
                 pbar.update(1)
             return out
 
+        # 다팩션이면 run_simulation_all_pairs 사용
+        n_factions = int(self.mean_design.get("n_factions", 2))
+        sim_func = run_simulation_all_pairs if n_factions > 2 else run_simulation
+        
         eval_results = []
         if self.use_parallel and self.max_workers > 1:
             try:
                 with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as ex:
                     futures = {
-                        ex.submit(run_simulation, dpos, self.train_episodes, self.eval_episodes, seed): (i, "pos")
-                        for i, dpos, _, seed in pairs
+                        ex.submit(sim_func, self.mean_design, self.train_episodes, self.eval_episodes, seed): (i, "center")
+                        for i, _, _, seed in pairs
                     }
                     futures.update({
-                        ex.submit(run_simulation, dneg, self.train_episodes, self.eval_episodes, seed): (i, "neg")
+                        ex.submit(sim_func, dpos, self.train_episodes, self.eval_episodes, seed): (i, "pos")
+                        for i, dpos, _, seed in pairs
+                    })
+                    futures.update({
+                        ex.submit(sim_func, dneg, self.train_episodes, self.eval_episodes, seed): (i, "neg")
                         for i, _, dneg, seed in pairs
                     })
 
@@ -364,8 +425,8 @@ class DesignOptimizer:
                             tmp[i] = {}
                         tmp[i][sign] = stats
                         done_pair[i] += 1
-                        if done_pair[i] == 2:
-                            eval_results.append((i, tmp[i]["pos"], tmp[i]["neg"]))
+                        if done_pair[i] == 3:
+                            eval_results.append((i, tmp[i]["center"], tmp[i]["pos"], tmp[i]["neg"]))
                             pbar.update(1)
             except Exception:
                 eval_results = _serial_eval()
@@ -375,39 +436,46 @@ class DesignOptimizer:
         pbar.close()
         eval_results.sort(key=lambda x: x[0])
 
-        for i, stats_pos, stats_neg in eval_results:
+        for i, stats_center, stats_pos, stats_neg in eval_results:
             epsilon = epsilons[i]
+            eps_norm2 = float(sum(float(v) * float(v) for v in epsilon.values()))
 
             loss_pos = self.get_loss(stats_pos)
             loss_neg = self.get_loss(stats_neg)
 
+            # LBO(설계공간 라플라시안) 기반 곡률: 곡률이 큰 방향은 업데이트를 약하게(=안정 설계 선호)
+            lbo = self.get_lbo_curvature(stats_center, stats_pos, stats_neg, eps_norm2=eps_norm2)
+            # 가중치(단순): 1 / (1 + λ * |ΔP|)
+            # λ는 차후 튜닝 가능. 우선 1.0으로 시작.
+            lbo_w = 1.0 / (1.0 + 1.0 * float(lbo))
+
             if self.verbose:
                 print(
-                    f"    Sample {i+1} (+): Loss={loss_pos:.4f} | P0={stats_pos['p0_win_rate']:.2f} "
+                    f"    Sample {i+1} (+): Loss={loss_pos:.4f} LBO={lbo:.4f} w={lbo_w:.3f} | P0={stats_pos['p0_win_rate']:.2f} "
                     f"P1={stats_pos['p1_win_rate']:.2f} Draw={stats_pos['draw_rate']:.2f} Dist={stats_pos['avg_distance']:.2f}"
                 )
                 print(
-                    f"    Sample {i+1} (-): Loss={loss_neg:.4f} | P0={stats_neg['p0_win_rate']:.2f} "
+                    f"    Sample {i+1} (-): Loss={loss_neg:.4f} LBO={lbo:.4f} w={lbo_w:.3f} | P0={stats_neg['p0_win_rate']:.2f} "
                     f"P1={stats_neg['p1_win_rate']:.2f} Draw={stats_neg['draw_rate']:.2f} Dist={stats_neg['avg_distance']:.2f}"
                 )
 
             diff = loss_pos - loss_neg
             for k in self.optimizable_keys:
-                gradients[k] += diff * epsilon[k] / (2 * self.sigma)
+                gradients[k] += float(lbo_w) * diff * epsilon[k] / (2 * self.sigma)
 
-            results.append((loss_pos, loss_neg))
+            results.append((loss_pos, loss_neg, lbo))
             
         # 평균 그라디언트로 업데이트
         avg_grad = {k: v / (self.n_samples // 2) for k, v in gradients.items()}
         
         for k in self.optimizable_keys:
-            self.mean_design[k] -= self.lr * avg_grad[k]
-            # 범위 제약
-            self.mean_design[k] = max(0.1, self.mean_design[k])
+            base = float(self.mean_design.get(k, 0.0))
+            self.mean_design[k] = base - self.lr * float(avg_grad[k])
 
         # mean 자체도 클램프 (폭주/0으로 붕괴 방지)
         self.mean_design = self._clamp_design(self.mean_design)
             
-        avg_loss = np.mean(results)
+        # 첫 원소(loss_pos)의 평균으로 로깅용 스칼라를 만든다
+        avg_loss = float(np.mean([r[0] for r in results])) if results else 0.0
         return avg_loss, self.mean_design
 

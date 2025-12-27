@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+from typing import List, Tuple
 
 class SimplePolicy(nn.Module):
     """
@@ -118,6 +118,70 @@ class SimplePolicy(nn.Module):
         a, logp_a = self.get_action(uobs, action_mask=mask, attack_bonus=0.0)
         return ui, a, (logp_sel + logp_a)
 
+def get_turn_action_with_env(policy: SimplePolicy, env, f: int, unit_obs: List[torch.Tensor]) -> Tuple[int, int, torch.Tensor]:
+    """
+    GridCombatEnv는 유닛별 이동 패턴 길이(len(move_pattern))에 따라 action 의미가 달라집니다.
+    따라서 "유닛 타입별 고정 action 공간"이 아니라, env의 패턴 길이에 맞춘 마스킹을 사용해야 합니다.
+
+    반환: (unit_index, action, log_prob_total)
+    """
+    if len(unit_obs) == 0:
+        return 0, 0, torch.tensor(0.0)
+
+    alive_mask: List[bool] = []
+    for u in unit_obs:
+        try:
+            alive_mask.append(float(u[2].item()) > 0.0)
+        except Exception:
+            alive_mask.append(False)
+
+    if not any(alive_mask):
+        return 0, 0, torch.tensor(0.0)
+
+    sel_logits = []
+    for ok, u in zip(alive_mask, unit_obs):
+        if not ok:
+            sel_logits.append(torch.tensor(-1e9))
+            continue
+        sel_logits.append(policy.forward_select_logit(u))
+    sel_logits = torch.stack(sel_logits)
+    sel_probs = F.softmax(sel_logits, dim=-1)
+    sel_dist = torch.distributions.Categorical(sel_probs)
+    ui = int(sel_dist.sample().item())
+    logp_sel = sel_dist.log_prob(torch.tensor(ui))
+
+    uobs = unit_obs[ui]
+    in_range = 0.0
+    try:
+        in_range = float(uobs[11].item())
+    except Exception:
+        in_range = 0.0
+
+    # env 기반 이동 패턴 길이로 action 공간을 정의한다.
+    t = int(env.unit_types[f][ui])
+    pattern_id = int(env.typespecs[f][t].get("pattern", 0))
+    move_pattern, _, _ = env.MOVE_PATTERN_POOL[int(pattern_id)]
+    move_dirs = int(len(move_pattern))
+    attack_action = int(move_dirs)  # env.step에서 action >= len(move_pattern)면 공격
+
+    # policy 출력 dim(9) 내에 있어야 함: 최대 패턴 길이가 8이므로 attack_action은 최대 8
+    move_dirs = max(1, min(8, move_dirs))
+    attack_action = max(1, min(8, attack_action))
+
+    mask = torch.zeros(9, dtype=torch.bool)
+    for i in range(move_dirs):
+        mask[i] = True
+    mask[attack_action] = in_range > 0.0
+
+    # 사거리 안이면 공격 강제(퇴화: 이동만 반복 방지)
+    if in_range > 0.0:
+        for i in range(move_dirs):
+            mask[i] = False
+        mask[attack_action] = True
+
+    a, logp_a = policy.get_action(uobs, action_mask=mask, attack_bonus=0.0)
+    return ui, a, (logp_sel + logp_a)
+
 def _actions_for_faction(policy: SimplePolicy, unit_obs: List[torch.Tensor]):
     actions = []
     log_probs = []
@@ -167,12 +231,12 @@ def train_one_episode(env, policies: List[SimplePolicy], optimizers: List[torch.
         obs0_units, obs1_units = obs
         side = int(getattr(env, "side_to_act", 0))
         if side == 0:
-            ui, a, lp = policies[0].get_turn_action(obs0_units)
+            ui, a, lp = get_turn_action_with_env(policies[0], env, 0, obs0_units)
             next_obs, rewards, done, info = env.step((0, ui, a))
             log_probs_sum[0].append(lp)
             log_probs_sum[1].append(torch.tensor(0.0))
         else:
-            ui, a, lp = policies[1].get_turn_action(obs1_units)
+            ui, a, lp = get_turn_action_with_env(policies[1], env, 1, obs1_units)
             next_obs, rewards, done, info = env.step((1, ui, a))
             log_probs_sum[0].append(torch.tensor(0.0))
             log_probs_sum[1].append(lp)
@@ -201,8 +265,11 @@ def train_one_episode(env, policies: List[SimplePolicy], optimizers: List[torch.
             loss -= lp * ret
             
         optimizers[pid].zero_grad()
-        loss.backward()
-        optimizers[pid].step()
+        # 에피소드가 첫 턴에 끝나는 등, 해당 pid가 실제로 한 행동이 없으면
+        # loss가 파라미터 그래프에 연결되지 않을 수 있습니다.
+        if isinstance(loss, torch.Tensor) and loss.requires_grad:
+            loss.backward()
+            optimizers[pid].step()
         
     return info
 

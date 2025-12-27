@@ -147,37 +147,89 @@ class GridCombatEnv:
     - 이동 패턴: 유닛 타입별로 다름 (직선/대각선/L자/전방향)
     """
 
-    # 이동 방향 패턴 (dx, dy)
-    # 직선(룩): 상하좌우
-    MOVE_ORTHOGONAL = [(0, -1), (0, 1), (-1, 0), (1, 0)]
-    # 대각선(비숍): 대각 4방향
-    MOVE_DIAGONAL = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-    # 전방향(퀸/킹): 8방향
-    MOVE_ALL = MOVE_ORTHOGONAL + MOVE_DIAGONAL
-    # L자(나이트): 8가지 L자 점프
-    MOVE_KNIGHT = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
+    # ========== 이동 패턴 풀 (12종) ==========
+    # 각 패턴은 (dx, dy) 리스트 + 슬라이딩 여부
+    # 슬라이딩=True: 해당 방향으로 move_range칸까지 슬라이딩
+    # 슬라이딩=False: 정확히 그 위치로 점프 (장애물 무시)
+    
+    # 기본 방향
+    _ORTHOGONAL = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # 상하좌우
+    _DIAGONAL = [(-1, -1), (-1, 1), (1, -1), (1, 1)]  # 대각 4방향
+    _ALL_8 = _ORTHOGONAL + _DIAGONAL  # 8방향
+    
+    # 점프 패턴 (체스 기반)
+    _KNIGHT = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]  # L자
+    _CAMEL = [(-3, -1), (-3, 1), (-1, -3), (-1, 3), (1, -3), (1, 3), (3, -1), (3, 1)]   # 3+1 점프
+    _ZEBRA = [(-3, -2), (-3, 2), (-2, -3), (-2, 3), (2, -3), (2, 3), (3, -2), (3, 2)]   # 3+2 점프
+    _ELEPHANT = [(-2, -2), (-2, 2), (2, -2), (2, 2)]  # 대각 2칸 점프
+    _DABBABA = [(-2, 0), (2, 0), (0, -2), (0, 2)]     # 직선 2칸 점프
+    _ALFIL = [(-2, -2), (-2, 2), (2, -2), (2, 2)]     # 대각 2칸 점프 (=elephant)
+    
+    # 특수 패턴
+    _FORWARD_ONLY = [(0, -1)]  # 전진만 (폰 스타일, P0 기준)
+    _BACKWARD_ONLY = [(0, 1)]  # 후진만
+    _SIDE_ONLY = [(-1, 0), (1, 0)]  # 좌우만
+    
+    # 패턴 ID -> (방향 리스트, 슬라이딩 여부, 설명)
+    MOVE_PATTERN_POOL = {
+        0: (_ORTHOGONAL, True, "orthogonal_slide"),   # 룩: 직선 슬라이딩
+        1: (_DIAGONAL, True, "diagonal_slide"),       # 비숍: 대각 슬라이딩
+        2: (_ALL_8, True, "all_slide"),               # 퀸: 전방향 슬라이딩
+        3: (_ALL_8, False, "all_jump"),               # 전방향 점프 (장애물 무시)
+        4: (_KNIGHT, False, "knight"),                # 나이트: L자 점프
+        5: (_CAMEL, False, "camel"),                  # 카멜: 3+1 점프
+        6: (_ZEBRA, False, "zebra"),                  # 제브라: 3+2 점프
+        7: (_ELEPHANT, False, "elephant"),            # 엘리펀트: 대각 2칸 점프
+        8: (_DABBABA, False, "dabbaba"),              # 다바바: 직선 2칸 점프
+        9: (_ORTHOGONAL, False, "orthogonal_jump"),   # 직선 점프 (장애물 무시)
+        10: (_DIAGONAL, False, "diagonal_jump"),      # 대각 점프 (장애물 무시)
+        11: (_FORWARD_ONLY, True, "forward_slide"),   # 전진 슬라이딩만
+    }
+    
+    NUM_PATTERNS = len(MOVE_PATTERN_POOL)  # 12종
 
-    # 유닛 타입별 이동 패턴
-    TYPE_MOVE_PATTERNS = {
-        "melee": MOVE_ORTHOGONAL,   # 룩처럼 직선
-        "ranged": MOVE_ALL,         # 퀸처럼 전방향
-        "scout": MOVE_KNIGHT,       # 나이트처럼 L자 점프
-        "tank": MOVE_ORTHOGONAL,    # 직선만, 느림
-        "siege": MOVE_ORTHOGONAL,   # 직선만, 느림
-        "king": MOVE_ALL,           # 전방향, 1칸
+    # ========== 공격 패턴 풀 (LBO/최적화 대상) ==========
+    # 이동 패턴과 대부분 공유하되, "pawn 대각 공격"을 추가한다.
+    ATTACK_PATTERN_POOL = {
+        0: (_ORTHOGONAL, True, "orthogonal_slide"),
+        1: (_DIAGONAL, True, "diagonal_slide"),
+        2: (_ALL_8, True, "all_slide"),
+        3: (_ALL_8, False, "all_jump"),
+        4: (_KNIGHT, False, "knight"),
+        5: (_CAMEL, False, "camel"),
+        6: (_ZEBRA, False, "zebra"),
+        7: (_ELEPHANT, False, "elephant"),
+        8: (_DABBABA, False, "dabbaba"),
+        9: (_ORTHOGONAL, False, "orthogonal_jump"),
+        10: (_DIAGONAL, False, "diagonal_jump"),
+        11: (_FORWARD_ONLY, True, "forward_slide"),
+        12: (_DIAGONAL, False, "pawn_diag"),
     }
 
-    TYPE_NAMES = ["melee", "ranged", "scout", "tank", "siege", "king"]  # 6종 (킹 추가)
+    NUM_ATTACK_PATTERNS = len(ATTACK_PATTERN_POOL)  # 13종 (0..12)
+    
+    # 킹은 패턴 고정 (전방향 1칸)
+    KING_PATTERN_ID = 2  # all_slide, move=1
 
-    def __init__(self, config: Dict[str, float], seed: int = 42):
+    TYPE_NAMES = ["unit0", "unit1", "unit2", "unit3", "unit4", "king"]  # 5종 커스텀 + 킹
+
+    def __init__(self, config: Dict[str, float], seed: int = 42, factions: Tuple[int, int] = (0, 1)):
+        """
+        factions: 이번 게임에서 싸울 2팩션의 ID (예: (0, 1), (0, 2), (1, 2))
+        config에는 p0, p1, p2, ... 형태로 각 팩션 설정 가능
+        """
         self.config = config
         self.rng = np.random.default_rng(seed)
+        self.factions = factions  # 이번 게임의 두 팩션 ID
 
         self.width = int(config.get("width", 12))
         self.height = int(config.get("height", 12))
         self.max_steps = int(config.get("max_steps", 120))
+        
+        # 총 팩션 수 (config에서 자동 감지)
+        self.n_factions = int(config.get("n_factions", 2))
 
-        # 유닛 타입 6종: 0..5 (melee/ranged/scout/tank/siege/king)
+        # 유닛 타입 6종: unit0~unit4 + king
         # 킹은 항상 1개 고정, 나머지는 config에서 가져옴
         def get_type_counts(prefix: str, default_total: int) -> List[int]:
             provided = []
@@ -209,48 +261,186 @@ class GridCombatEnv:
             result.append(1)  # 킹 1개 추가
             return result
 
-        p0_counts = get_type_counts("p0", 16)
-        p1_counts = get_type_counts("p1", 10)
+        # 이번 게임에 참여하는 두 팩션만 로드
+        f0, f1 = factions
+        p0_counts = get_type_counts(f"p{f0}", 16)
+        p1_counts = get_type_counts(f"p{f1}", 10)
 
         self.type_counts = [p0_counts, p1_counts]
         self.n_units = [int(sum(p0_counts)), int(sum(p1_counts))]
         
         # 킹 인덱스 저장 (마지막 유닛이 킹)
         self.king_type_idx = self.TYPE_NAMES.index("king")
+        
+        # 실제 팩션 ID -> 게임 내 인덱스 (0, 1) 매핑
+        self.faction_ids = factions
 
         # 타입별 스탯 (팩션별로 독립)
-        # move: 이동 거리 (나이트는 1=L자 1회 점프)
+        # pattern: 이동 패턴 ID (0~11)
+        # move: 이동 거리/점프 횟수
         # range: 공격 사거리 (맨해튼)
         def type_specs(prefix: str):
             # 기본값(타입별) - config에 없으면 여기 기본이 적용됨
+            # unit0~unit4는 커스텀, king은 고정
             defaults = {
-                "melee": {"move": 3.0, "range": 1.0, "damage": 1.0, "hp": 3.0},   # 직선 3칸
-                "ranged": {"move": 2.0, "range": 4.0, "damage": 1.0, "hp": 2.0},  # 전방향 2칸, 원거리 공격
-                "scout": {"move": 1.0, "range": 1.0, "damage": 1.0, "hp": 2.0},   # L자 1회 점프
-                "tank": {"move": 1.0, "range": 1.0, "damage": 1.0, "hp": 6.0},    # 직선 1칸, 고체력
-                "siege": {"move": 1.0, "range": 6.0, "damage": 1.5, "hp": 2.0},   # 직선 1칸, 초장거리 공격
-                "king": {"move": 1.0, "range": 1.0, "damage": 0.5, "hp": 5.0},    # 전방향 1칸, 잡히면 패배
+                "unit0": {"pattern": 0, "move": 3.0, "range": 1.0, "attack_pattern": 0, "damage": 1.0, "hp": 3.0},   # 직선 슬라이딩
+                "unit1": {"pattern": 2, "move": 2.0, "range": 4.0, "attack_pattern": 2, "damage": 1.0, "hp": 2.0},   # 전방향 슬라이딩
+                "unit2": {"pattern": 4, "move": 1.0, "range": 1.0, "attack_pattern": 4, "damage": 1.0, "hp": 2.0},   # 나이트 점프
+                "unit3": {"pattern": 0, "move": 1.0, "range": 1.0, "attack_pattern": 0, "damage": 1.0, "hp": 6.0},   # 직선 슬라이딩 (탱크)
+                "unit4": {"pattern": 0, "move": 1.0, "range": 6.0, "attack_pattern": 0, "damage": 1.5, "hp": 2.0},   # 직선 슬라이딩 (시즈)
+                "king": {"pattern": 2, "move": 1.0, "range": 1.0, "attack_pattern": 2, "damage": 0.5, "hp": 5.0},    # 전방향 1칸 고정
             }
 
             specs = []
             for name in self.TYPE_NAMES:
                 base = defaults[name]
+                # 킹은 패턴 고정
+                if name == "king":
+                    pattern_id = self.KING_PATTERN_ID
+                else:
+                    pattern_id = int(config.get(f"{prefix}_{name}_pattern", base["pattern"]))
+                    pattern_id = max(0, min(self.NUM_PATTERNS - 1, pattern_id))
+
+                # 공격 패턴: 기본은 이동 패턴을 따르되, pawn(=forward_slide)은 기본 공격을 pawn_diag로 둔다.
+                default_attack = base.get("attack_pattern", pattern_id)
+                if pattern_id == 11 and name != "king":
+                    default_attack = 12
+                atk_id = int(config.get(f"{prefix}_{name}_attack_pattern", default_attack))
+                atk_id = max(0, min(self.NUM_ATTACK_PATTERNS - 1, atk_id))
+                
                 specs.append(
                     {
+                        "pattern": pattern_id,
                         "move": float(config.get(f"{prefix}_{name}_move", base["move"])),
                         "range": float(config.get(f"{prefix}_{name}_range", base["range"])),
+                        "attack_pattern": atk_id,
                         "damage": float(config.get(f"{prefix}_{name}_damage", base["damage"])),
                         "hp": float(config.get(f"{prefix}_{name}_hp", base["hp"])),
                     }
                 )
             return specs
 
+        # 실제 팩션 ID로 스탯 로드
+        f0, f1 = factions
         self.typespecs = [
-            type_specs("p0"),
-            type_specs("p1"),
+            type_specs(f"p{f0}"),
+            type_specs(f"p{f1}"),
         ]
 
         self.reset()
+
+    def _spawn_columns(self) -> set:
+        mid = int(self.width // 2)
+        # 현재 배치 규칙과 동일한 스폰 컬럼(양 진영) 집합
+        return {
+            max(0, mid - 3),
+            max(0, mid - 2),
+            min(self.width - 1, mid + 1),
+            min(self.width - 1, mid + 2),
+        }
+
+    def _build_obstacles(self) -> set:
+        density = float(self.config.get("obstacle_density", 0.0))
+        pattern = int(self.config.get("obstacle_pattern", 0))
+        if density <= 0.0 or pattern <= 0:
+            return set()
+
+        # 과도한 장애물은 배치/이동을 붕괴시키므로 상한을 둔다
+        density = max(0.0, min(0.35, density))
+        n_total = int(round(self.width * self.height * density))
+        if n_total <= 0:
+            return set()
+
+        banned_cols = self._spawn_columns()
+        max_y = int(self.height)
+        max_x = int(self.width)
+
+        # (공정성) 좌우 대칭 배치가 기본. 중앙 컬럼(홀수 폭)은 가능하면 비운다.
+        def mirror_x(x: int) -> int:
+            return (max_x - 1) - x
+
+        def symmetric_scatter(candidates: list, total: int) -> set:
+            if not candidates or total <= 0:
+                return set()
+            pairs = min(len(candidates), max(1, int(total) // 2))
+            picks = self.rng.choice(len(candidates), size=pairs, replace=False)
+            out = set()
+            for idx in picks:
+                x, y = candidates[int(idx)]
+                mx = mirror_x(int(x))
+                out.add((int(x), int(y)))
+                out.add((int(mx), int(y)))
+            return out
+
+        # pattern 1: 랜덤 대칭 산포(전역)
+        def build_pattern_1() -> set:
+            half = max_x // 2
+            candidates = []
+            for x in range(half):
+                mx = mirror_x(x)
+                if x in banned_cols or mx in banned_cols:
+                    continue
+                for y in range(max_y):
+                    candidates.append((x, y))
+            return symmetric_scatter(candidates, n_total)
+
+        # pattern 2: 중앙 장벽(벽) + 랜덤 홀
+        def build_pattern_2() -> set:
+            mid = int(max_x // 2)
+            wall_cols = [mid - 1, mid] if (max_x % 2 == 0) else [mid]
+            wall_cols = [c for c in wall_cols if 0 <= c < max_x and c not in banned_cols]
+            if not wall_cols:
+                return build_pattern_1()
+
+            # 벽을 전부 막으면 퇴화하기 쉬우므로, 일부 행을 비워 "통로"를 만든다.
+            gap_rows_cnt = max(2, int(max_y // 4))
+            gap_rows_cnt = min(gap_rows_cnt, max_y)
+            gap_rows = set(self.rng.choice(max_y, size=gap_rows_cnt, replace=False).tolist())
+
+            cells = []
+            for x in wall_cols:
+                for y in range(max_y):
+                    if y in gap_rows:
+                        continue
+                    cells.append((x, y))
+
+            if not cells:
+                return build_pattern_1()
+
+            k = min(len(cells), n_total)
+            picks = self.rng.choice(len(cells), size=k, replace=False)
+            out = set()
+            for idx in picks:
+                x, y = cells[int(idx)]
+                out.add((int(x), int(y)))
+            return out
+
+        # pattern 3: 중앙 집중(센터 사각 영역) 대칭 산포
+        def build_pattern_3() -> set:
+            x0 = int(max(0, max_x // 4))
+            x1 = int(min(max_x, max_x - max_x // 4))
+            y0 = int(max(0, max_y // 4))
+            y1 = int(min(max_y, max_y - max_y // 4))
+            if x1 - x0 <= 0 or y1 - y0 <= 0:
+                return build_pattern_1()
+
+            half = max_x // 2
+            candidates = []
+            for x in range(x0, min(x1, half)):
+                mx = mirror_x(x)
+                if x in banned_cols or mx in banned_cols:
+                    continue
+                for y in range(y0, y1):
+                    candidates.append((x, y))
+            if not candidates:
+                return build_pattern_1()
+            return symmetric_scatter(candidates, n_total)
+
+        if pattern == 2:
+            return build_pattern_2()
+        if pattern == 3:
+            return build_pattern_3()
+        return build_pattern_1()
 
     def reset(self, first_turn=None):
         """
@@ -270,6 +460,11 @@ class GridCombatEnv:
         self.king_dead = [False, False]  # 킹 사망 플래그
 
         occupied = set()
+
+        # 장애물(정적 블록) 생성: 유닛 배치 전에 occupied에 넣어 충돌을 막는다
+        self.obstacles = self._build_obstacles()
+        for pos in self.obstacles:
+            occupied.add(pos)
 
         # 턴제(턴당 1유닛)에서는 가장자리 배치(좌 2열 vs 우 2열)가 교전까지 너무 오래 걸려
         # 무승부로 퇴화하기 쉽습니다. 맵은 크게 유지하되, 초반 교전이 가능하도록 중앙 근처에 배치합니다.
@@ -351,6 +546,79 @@ class GridCombatEnv:
 
         return nearest_idx, nearest_dist
 
+    def _attack_targets(self, f: int, i: int, occupied: Dict[Tuple[int, int], Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """
+        현재 유닛(f,i)이 공격 가능한 (def_f, enemy_i) 목록을 반환합니다.
+        공격 패턴/사거리/장애물(시야) 규칙을 반영합니다.
+        """
+        if self.hps[f][i] <= 0:
+            return []
+
+        x, y = self.positions[f][i]
+        t = int(self.unit_types[f][i])
+        spec = self.typespecs[f][t]
+
+        atk_id = int(spec.get("attack_pattern", spec.get("pattern", 0)))
+        atk_id = max(0, min(self.NUM_ATTACK_PATTERNS - 1, atk_id))
+        dirs, is_sliding, name = self.ATTACK_PATTERN_POOL[atk_id]
+
+        atk_range = int(max(1.0, round(float(spec.get("range", 1.0)))))
+        atk_range = max(1, min(8, atk_range))
+
+        # 방향 보정
+        if name == "forward_slide":
+            dirs = [(1, 0)] if f == 0 else [(-1, 0)]
+            is_sliding = True
+        elif name == "pawn_diag":
+            dirs = [(1, -1), (1, 1)] if f == 0 else [(-1, -1), (-1, 1)]
+            is_sliding = False
+
+        targets: List[Tuple[int, int]] = []
+        for dx, dy in dirs:
+            if is_sliding:
+                for step in range(1, atk_range + 1):
+                    nx = int(x + dx * step)
+                    ny = int(y + dy * step)
+                    if not (0 <= nx < self.width and 0 <= ny < self.height):
+                        break
+                    occ = occupied.get((nx, ny), None)
+                    if occ is None:
+                        continue
+                    occ_f, occ_i = int(occ[0]), int(occ[1])
+                    if occ_f == -1:
+                        break
+                    if occ_f == f:
+                        break
+                    targets.append((occ_f, occ_i))
+                    break
+            else:
+                for step in range(1, atk_range + 1):
+                    nx = int(x + dx * step)
+                    ny = int(y + dy * step)
+                    if not (0 <= nx < self.width and 0 <= ny < self.height):
+                        break
+                    occ = occupied.get((nx, ny), None)
+                    if occ is None:
+                        continue
+                    occ_f, occ_i = int(occ[0]), int(occ[1])
+                    if occ_f == -1:
+                        continue
+                    if occ_f == f:
+                        continue
+                    targets.append((occ_f, occ_i))
+                    break
+
+        return targets
+
+    def _build_occupied_map(self) -> Dict[Tuple[int, int], Tuple[int, int]]:
+        occupied: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        for ff in (0, 1):
+            for ii in self._alive_indices(ff):
+                occupied[self.positions[ff][ii]] = (ff, ii)
+        for pos in getattr(self, "obstacles", set()):
+            occupied[pos] = (-1, -1)
+        return occupied
+
     def _get_unit_obs(self, f: int, i: int) -> torch.Tensor:
         # dead 유닛은 0벡터
         if self.hps[f][i] <= 0:
@@ -391,6 +659,7 @@ class GridCombatEnv:
     def _get_obs(self):
         # 파이썬 루프 최소화: nearest를 한 번에 계산하고 obs를 구성
         nearest_idx, nearest_dist = self._nearest_enemy_all()
+        occupied = self._build_occupied_map()
 
         obs_all = [[], []]
         for f in (0, 1):
@@ -423,14 +692,15 @@ class GridCombatEnv:
                     dxn = (ex - x) / denom_x
                     dyn = (ey - y) / denom_y
                     distn = float(nearest_dist[f][i]) / denom_d
-                    d_raw = int(nearest_dist[f][i])
-                    in_range = 1.0 if d_raw <= int(max(1.0, round(spec["range"]))) else 0.0
+                    # 공격 패턴 기준 "공격 가능 여부"를 계산한다.
+                    in_range = 1.0 if len(self._attack_targets(f, i, occupied)) > 0 else 0.0
 
                 alive_self_cnt = len(alive_self)
                 alive_enemy_cnt = len(self._alive_indices(opp))
 
                 # 타입/스탯 피처(정규화)
-                type_norm = float(t) / 4.0  # 0..1
+                # unit0~unit4 + king(=5)까지 포함하므로 0..1로 정규화
+                type_norm = float(t) / 5.0
                 move_norm = float(spec["move"]) / 4.0
                 range_norm = float(spec["range"]) / 6.0
 
@@ -478,50 +748,49 @@ class GridCombatEnv:
         for ff in (0, 1):
             for ii in self._alive_indices(ff):
                 occupied[self.positions[ff][ii]] = (ff, ii)
+        for pos in getattr(self, "obstacles", set()):
+            occupied[pos] = (-1, -1)
 
         # 1) 이동/정지: 현재 턴 유닛 1개만 처리
-        # 유닛 타입별 이동 패턴 적용
+        # 패턴 ID 기반 동적 이동 패턴 적용
         attacks_this_step = 0
+        move_pattern = self._ORTHOGONAL  # 기본값
+        is_sliding = True
+        
         if i in self._alive_indices(f):
             t = int(self.unit_types[f][i])
-            type_name = self.TYPE_NAMES[t]
-            move_pattern = self.TYPE_MOVE_PATTERNS.get(type_name, self.MOVE_ORTHOGONAL)
+            pattern_id = int(self.typespecs[f][t].get("pattern", 0))
+            pattern_id = max(0, min(self.NUM_PATTERNS - 1, pattern_id))
+            move_pattern, is_sliding, pattern_name = self.MOVE_PATTERN_POOL[pattern_id]
             move_range = int(max(1.0, round(self.typespecs[f][t]["move"])))
+
+            # "forward_slide"는 팩션 진행 방향(좌↔우)을 따른다.
+            # 현재 배치 규칙은 f=0이 왼쪽, f=1이 오른쪽에서 시작하므로
+            # forward는 f=0:+x, f=1:-x로 정의한다.
+            if pattern_name == "forward_slide":
+                move_pattern = [(1, 0)] if f == 0 else [(-1, 0)]
             
-            # action 0~7: 이동 방향 선택 (패턴에 따라 사용 가능한 방향 수 다름)
-            # action >= 패턴 길이: 공격(5) 또는 무효
+            # action 0~N-1: 이동 방향 선택 (패턴에 따라 방향 수 다름)
+            # action >= 패턴 길이: 공격
             if a < len(move_pattern):
                 dx, dy = move_pattern[a]
                 x, y = self.positions[f][i]
                 
-                # 나이트(L자)는 점프, 나머지는 슬라이딩
-                if type_name == "scout":
-                    # L자 점프: move_range만큼 반복 점프 가능
-                    for _ in range(move_range):
-                        nx = int(x + dx)
-                        ny = int(y + dy)
-                        if 0 <= nx < self.width and 0 <= ny < self.height and (nx, ny) not in occupied:
-                            del occupied[(x, y)]
-                            occupied[(nx, ny)] = (f, i)
-                            self.positions[f][i] = (nx, ny)
-                            x, y = nx, ny
-                        else:
-                            break
-                else:
-                    # 직선/대각선 슬라이딩: move_range칸까지 이동
-                    def try_move(dir_dx: int, dir_dy: int) -> bool:
+                if is_sliding:
+                    # 슬라이딩: 해당 방향으로 move_range칸까지, 경로 상 장애물 체크
+                    def try_slide(dir_dx: int, dir_dy: int) -> bool:
                         nonlocal x, y
                         for step in range(move_range, 0, -1):
                             nx = int(max(0, min(self.width - 1, x + dir_dx * step)))
                             ny = int(max(0, min(self.height - 1, y + dir_dy * step)))
                             if (nx, ny) == (x, y):
                                 continue
-                            # 경로 상 장애물 체크 (슬라이딩이므로)
+                            # 경로 상 장애물 체크
                             blocked = False
                             for s in range(1, step + 1):
                                 check_x = int(x + dir_dx * s)
                                 check_y = int(y + dir_dy * s)
-                                if (check_x, check_y) in occupied and (check_x, check_y) != (nx, ny):
+                                if (check_x, check_y) in occupied:
                                     blocked = True
                                     break
                             if blocked:
@@ -534,15 +803,44 @@ class GridCombatEnv:
                             return True
                         return False
 
-                    moved = try_move(dx, dy)
+                    moved = try_slide(dx, dy)
                     if not moved:
-                        # 다른 방향 시도
                         other_dirs = list(move_pattern)
                         self.rng.shuffle(other_dirs)
                         for odx, ody in other_dirs:
                             if (odx, ody) == (dx, dy):
                                 continue
-                            if try_move(odx, ody):
+                            if try_slide(odx, ody):
+                                break
+                else:
+                    # 점프: 정확히 (dx, dy) 위치로 이동, 장애물 무시
+                    # move_range만큼 반복 점프 가능
+                    for _ in range(move_range):
+                        nx = int(x + dx)
+                        ny = int(y + dy)
+                        if 0 <= nx < self.width and 0 <= ny < self.height and (nx, ny) not in occupied:
+                            del occupied[(x, y)]
+                            occupied[(nx, ny)] = (f, i)
+                            self.positions[f][i] = (nx, ny)
+                            x, y = nx, ny
+                        else:
+                            # 원래 방향 막히면 다른 방향 시도
+                            tried_other = False
+                            other_dirs = list(move_pattern)
+                            self.rng.shuffle(other_dirs)
+                            for odx, ody in other_dirs:
+                                if (odx, ody) == (dx, dy):
+                                    continue
+                                onx = int(x + odx)
+                                ony = int(y + ody)
+                                if 0 <= onx < self.width and 0 <= ony < self.height and (onx, ony) not in occupied:
+                                    del occupied[(x, y)]
+                                    occupied[(onx, ony)] = (f, i)
+                                    self.positions[f][i] = (onx, ony)
+                                    x, y = onx, ony
+                                    tried_other = True
+                                    break
+                            if not tried_other:
                                 break
 
         # 2) 공격 처리: 현재 턴 유닛 1개만 처리
@@ -551,22 +849,31 @@ class GridCombatEnv:
         is_attack_action = (a >= len(move_pattern)) if i in self._alive_indices(f) else False
         if is_attack_action and i in self._alive_indices(f):
             t = int(self.unit_types[f][i])
-            atk_range = int(max(1.0, round(self.typespecs[f][t]["range"])))
             dmg = float(self.typespecs[f][t]["damage"])
-            enemy_i = int(nearest_idx[f][i])
-            d = int(nearest_dist[f][i])
-            if enemy_i >= 0 and d <= atk_range:
-                def_f = 1 - f
-                self.hps[def_f][enemy_i] -= dmg
-                rewards[f] += dmg
-                rewards[def_f] -= dmg
-                self.history["attack_distances"].append(float(d))
-                attacks_this_step = 1
-                self.any_attack = True
-                
-                # 킹 사망 체크: 공격받은 유닛이 킹이고 HP <= 0이면 즉시 패배
-                if self.unit_types[def_f][enemy_i] == self.king_type_idx and self.hps[def_f][enemy_i] <= 0:
-                    self.king_dead[def_f] = True
+            targets = self._attack_targets(f, i, occupied)
+            if targets:
+                # 가장 가까운(맨해튼) 적을 자동 선택
+                x0, y0 = self.positions[f][i]
+                best = None
+                best_d = None
+                for def_f, enemy_i in targets:
+                    ex, ey = self.positions[def_f][enemy_i]
+                    d = self._manhattan((x0, y0), (ex, ey))
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best = (def_f, enemy_i)
+                if best is not None and best_d is not None:
+                    def_f, enemy_i = int(best[0]), int(best[1])
+                    self.hps[def_f][enemy_i] -= dmg
+                    rewards[f] += dmg
+                    rewards[def_f] -= dmg
+                    self.history["attack_distances"].append(float(best_d))
+                    attacks_this_step = 1
+                    self.any_attack = True
+
+                    # 킹 사망 체크: 공격받은 유닛이 킹이고 HP <= 0이면 즉시 패배
+                    if self.unit_types[def_f][enemy_i] == self.king_type_idx and self.hps[def_f][enemy_i] <= 0:
+                        self.king_dead[def_f] = True
 
         # 2-b) 거리 쉐이핑 보상(접근 유도): 살아있는 유닛들의 최근접 적 거리 평균을 줄이면 보상
         # 벡터화된 nearest_dist를 사용하므로 오버헤드가 거의 없음
