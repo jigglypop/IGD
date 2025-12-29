@@ -1,248 +1,291 @@
-## 제5장 라플라스–벨트라미(LBO): 벨만 방정식의 연속·기하 일반화
+## 제2장 라플라스–벨트라미(LBO): 벨만 → HJB → 이토(Itô) → 라플라시안 → (다양체) LBO → (설계공간) 2차 차분 정규화
 
-> 본 문서는 LB-IGD/Faction Chess IGD에서 “왜 라플라스–벨트라미(LBO)가 자연스러운가”와  
-> “벨만 방정식의 일반화(연속 극한 + 기하 일반화)가 왜 LBO로 이어지는가”를 논문 스타일 유도로 정리한다.
+> 본 문서는 LB-IGD/Faction Chess IGD에서 **“왜 라플라시안/라플라스–벨트라미(LBO) 관점이 필요한가?”**를
+> 강화학습의 기반인 **벨만 방정식**에서 출발해, 필요한 만큼만(최소한의 증명 스케치) 연결해서 설명합니다.
 >
-> 주의: 이 레포의 LBO는 “플레이 상태공간 PDE를 직접 푸는 것”이 아니라, **설계공간에서의 승률장 $P(x)$ 곡률(라플라시안) 억제**로 구현된다(4절).
+> - 관련 문서: 제1장 `docs/bellman.md`(계층적 정식화), 제3장 `docs/blackbox.md`(ES), 제4장 `docs/evaluation.md`(평가 프로토콜)
+> - 코드 대응: `src/core/designer.py`(설계공간 LBO), `src/core/lbo.py`(그래프 라플라시안), `tests/test.py`
 
 ---
 
-### 초록(요지)
-- Bellman(이산 DP)은 “한 스텝 앞”으로의 재귀 관계(고정점)이다.
-- 이를 연속 시간/연속 상태의 동적계획 원리(DPP)로 옮기면 HJB 편미분방정식(PDE)이 된다.
-- 상태가 확률적으로 변화(확산 포함)하면 HJB에는 **2차 미분(확산) 항**이 필연적으로 나타난다.
-- 유클리드 공간에서는 그 2차 항이 라플라시안 $\Delta$이고, 다양체(곡면)에서는 좌표 불변성을 위해 라플라스–벨트라미 $\Delta_g$로 일반화된다.
+### 0. 표기(Notation)
+이 문서에서 자주 쓰는 기호만 최소로 고정합니다.
 
-즉, “Bellman → LBO”는 다음 사슬로 이해하는 것이 정확하다.
-
-$$
-\text{Bellman / DPP}
-\;\Rightarrow\;
-\text{HJB (continuous-time DP)}
-\;\Rightarrow\;
-\text{diffusion term (2nd order)}
-\;\Rightarrow\;
-\Delta
-\;\Rightarrow\;
-\Delta_g
-$$
+- 설계 변수: \(x \in \mathcal{X}\) (맵/장애물/유닛 수/패턴/스탯 등)
+- 설계가 만드는 게임: \(\mathcal{M}_x\) (플레이 레벨의 MDP)
+- (플레이 레벨) 가치함수: \(V(s)\) 또는 \(V(x)\)
+- (설계 레벨) 승률 지형: \(P(x)\in[0,1]\)
+  - 2팩션이면 보통 \(P(x)=\mathrm{WinRate}_{p0}(x)\)
+  - 다팩션이면 \(P(x)\)를 쌍대결 승률행렬 \(W_{f,g}(x)\)로 본다(`evaluation.md`)
 
 ---
 
-## 1. 왜 라플라스–벨트라미인가(핵심 직관)
-### 1.1 “확산”은 2차 연산자다
-상태 값(가치, 신념, 승률 등)을 국소적으로 퍼뜨리는 동역학은 전형적으로
+### 1. 출발점: 이산 시간 벨만 방정식
+강화학습의 표준 형태(이산 시간, 마르코프성 가정)에서, 최적 가치함수는
 
 $$
-\partial_t u
+V^*(s)
 =
-\text{(drift)}
-\;+\;
-\text{(diffusion)}
-\;+\;
-\text{(reaction/source)}
+\max_{a\in\mathcal{A}}\Big(
+r(s,a)+\gamma\,\mathbb{E}[V^*(s')\mid s,a]
+\Big)
 $$
 
-꼴이다. 여기서 diffusion은 2차 미분 연산자(거칠기/곡률/스무딩을 반영)로 나타난다.
-
-### 1.2 “좌표 불변”으로 쓰려면 $\Delta_g$가 필요하다
-상태공간이 단순한 $\mathbb{R}^n$이 아니라, 곡면/다양체처럼 좌표 선택이 임의적인 공간이면:
-- 같은 물리/의미를 좌표만 바꿔도 결과가 달라지면 안 된다(좌표 불변).
-
-리만 다양체 $(\mathcal{M}, g)$에서 스칼라장 $f$에 대한 라플라스–벨트라미는 다음처럼 정의된다.
-
-$$
-\Delta_g f
-=
-\operatorname{div}_g(\nabla_g f)
-=
-\frac{1}{\sqrt{|g|}}
-\partial_i\!\left(\sqrt{|g|}\,g^{ij}\partial_j f\right)
-$$
-
-여기서 $g^{ij}$는 메트릭 $g$의 역행렬 성분, $|g|$는 행렬식이다.
+를 만족합니다. 핵심은 “현재 가치 = 즉시 보상 + 미래 가치의 할인된 기대값”이라는 **재귀 구조**입니다.
 
 ---
 
-## 2. Bellman/DPP → HJB (논문 스타일 유도)
-이 절은 “강화학습을 PDE로 비유”하는 게 아니라, **연속시간 확률 제어의 동적계획 원리(DPP)**를 통해 HJB를 얻는 표준 유도를 적는다.
+### 2. 연속 시간으로 보내기: HJB(해밀턴–야코비–벨만)
+연속 시간 버전은 “아주 짧은 시간 \(\Delta t\)”에 대해 동적계획 원리를 다시 쓰는 것으로 얻습니다.
+직관적으로는 다음 형태를 가정합니다.
 
-### 2.1 문제 설정: 연속시간 확률 제어(제어 확산)
-상태 $X_t \in \mathbb{R}^n$, 제어(행동) $a_t \in \mathcal{A}$에 대해 다음 SDE를 가정한다.
-
-$$
-dX_t = b(X_t, a_t)\,dt + \sigma(X_t, a_t)\,dW_t
-$$
-
-- $b$: drift(결정적 변화)
-- $\sigma$: diffusion(확산 스케일)
-- $W_t$: 표준 브라운 운동
-- $A(x,a) := \sigma(x,a)\sigma(x,a)^\top$ (확산 행렬)
-
-목적은 할인율 $\rho>0$ 하에서 보상 $r$의 할인 적분을 최대화하는 것이다.
+1) 상태는 연속 시간에서 확률미분방정식(SDE)을 따른다:
 
 $$
-V(x)
-:=
-\sup_{a_\cdot}
-\mathbb{E}_x\!\left[
-\int_{0}^{\infty} e^{-\rho t}\,r(X_t, a_t)\,dt
-\right]
+dX_t = b(X_t,a_t)\,dt + \sigma(X_t,a_t)\,dW_t
 $$
 
-### 2.2 DPP(동적계획 원리): “작은 시간 $\Delta t$”에서의 1-step 분해
-DPP는 다음을 말한다(표준 가정: $V$가 충분히 매끄럽고, $r,b,\sigma$가 적절한 정칙성을 가진다).
+2) 할인율을 \(\rho>0\)로 두고, 짧은 시간 구간에서의 Bellman 원리를 쓴다:
 
 $$
-V(x)
-=
-\sup_{a_\cdot}
-\mathbb{E}_x\!\left[
-\int_{0}^{\Delta t} e^{-\rho t}\,r(X_t, a_t)\,dt
+V(x)=
+\max_a \mathbb{E}\Big[
+\int_0^{\Delta t} e^{-\rho t} r(X_t,a)\,dt
+
 +
-e^{-\rho \Delta t}\,V(X_{\Delta t})
-\right]
+e^{-\rho\Delta t} V(X_{\Delta t})
+\Big].
 $$
 
-### 2.3 생성자(Generator)와 Itô 전개: 2차 항이 “자동으로” 나온다
-제어 $a$가 고정되어 있을 때의 미분 연산자(생성자)를 정의한다.
+\(\Delta t\to 0\)에서의 1차 근사를 적용하면
 
-$$
-(\mathcal{L}^a f)(x)
-:=
-\sum_{i} b_i(x,a)\,\partial_i f(x)
-\;+\;
-\frac{1}{2}\sum_{i,j} A_{ij}(x,a)\,\partial_i\partial_j f(x)
-$$
+- \(e^{-\rho \Delta t}\approx 1-\rho\Delta t\)
+- \(\mathbb{E}[V(X_{\Delta t})]\approx V(x) + \Delta t\,\mathcal{L}^a V(x)\) (여기서 \(\mathcal{L}^a\)는 생성자(generator))
 
-Itô 공식과 표준 계산으로, 작은 $\Delta t$에서
-
-$$
-\mathbb{E}_x\!\left[V(X_{\Delta t})\right]
-=
-V(x) + \Delta t\,(\mathcal{L}^a V)(x) + o(\Delta t)
-$$
-
-또한 보상 적분과 할인은
-
-$$
-\int_{0}^{\Delta t} e^{-\rho t}\,r(X_t, a_t)\,dt
-=
-r(x,a)\,\Delta t + o(\Delta t),
-\qquad
-e^{-\rho \Delta t} = 1 - \rho \Delta t + o(\Delta t)
-$$
-
-로 근사된다(정확히는 $r$의 정칙성과 $X_t$의 연속성 하에서 성립하는 표준 극한).
-
-### 2.4 HJB 도출(정지 문제)
-2.2식에 2.3식을 대입하고, $V(x)$를 소거한 뒤 $\Delta t$로 나누고 $\Delta t\to 0$을 취하면:
+가 되고, 정리하면 HJB가 됩니다.
 
 $$
 0
 =
-\sup_{a\in\mathcal{A}}
-\Big(
-r(x,a)
-(\mathcal{L}^a V)(x)
--\rho V(x)
-\Big)
+\max_a\Big(
+r(x,a)+\mathcal{L}^a V(x)-\rho V(x)
+\Big).
 $$
 
-이 식이 (무한 시간 지평/정지) HJB이다.  
-핵심은 $\mathcal{L}^a$에 2차 미분 항이 있으므로, **확산이 있으면 HJB는 2차 PDE가 된다는 점**이다.
+이제 핵심은 “\(\mathcal{L}^a\) 안에 무엇이 들어있는가?” 입니다.
 
 ---
 
-## 3. $\Delta$에서 $\Delta_g$로: “기하 일반화”가 왜 LBO인가
-### 3.1 유클리드에서 라플라시안 $\Delta$
-확산이 등방성이라 $A(x,a) = 2D(x,a)\,I$이면,
+### 3. 이토(Itô) 공식이 만들어내는 2차 미분 항(라플라시안의 출현)
+SDE
 
 $$
-\frac{1}{2}\mathrm{Tr}\!\left(A\nabla^2 V\right)
+dX_t = b\,dt + \sigma\,dW_t
+$$
+
+에 대해, 충분히 매끄러운 함수 \(V(X_t)\)에 이토 공식을 적용하면
+
+$$
+dV
 =
-\frac{1}{2}\mathrm{Tr}\!\left(2D I\nabla^2 V\right)
-=
-D\,\Delta V
-$$
-
-즉, 2차 항이 라플라시안으로 정리된다.
-
-### 3.2 다양체에서 라플라스–벨트라미 $\Delta_g$
-상태공간이 리만 다양체 $(\mathcal{M}, g)$이면, “등방성 확산”은 메트릭 $g$에 대해 정의된다.  
-이때 유클리드의 $\Delta$는 좌표 불변 연산자로의 일반화가 필요하고, 그 표준이 $\Delta_g$이다.
-
-특히 “등방성 확산”이 $A(x,a)$가 메트릭에 비례하는 형태(직관적으로 $A \propto g^{-1}$)로 주어지면,
-HJB의 확산항은 $D\,\Delta_g V$로 나타난다.
-
-요약하면:
-- Bellman/DPP를 연속화하면 HJB가 된다.
-- 확산이 있으면 HJB에 2차항이 생긴다.
-- 유클리드에서는 그 2차항이 $\Delta$, 다양체에서는 $\Delta_g$가 된다.
-
-따라서 “벨만의 일반화가 LBO”라는 문장은,
-**연속화 + 확산 포함 + 좌표 불변 기하 일반화**라는 의미를 포함하는 경우에만 정확하다.
-
----
-
-## 4. 이 레포에서의 LBO: 설계공간 승률장 $P(x)$의 곡률 억제
-이 레포의 바깥 레벨(설계 최적화)은 설계변수 $x$로부터 “게임/팩션/맵”이 결정되고,  
-그 결과로 관측되는 승률(또는 승률행렬)을 black-box로 평가한다.
-
-### 4.1 왜 설계공간에서 라플라시안을 보나
-$P(x)$가 설계공간에서 뾰족하면:
-- 작은 설계 변화가 승률을 급변시킨다(불안정/비강건).
-- 정수화/클램프(투영) 노이즈에 취약하다.
-- 평가 노이즈(학습/매칭 시드)에 취약하다.
-
-따라서 $P(x)$의 곡률(라플라시안 크기)을 억제하는 정규화는 “튼튼한 밸런스”를 선호하게 만든다.
-
-### 4.2 구현: 무작위 방향 2차차분(중심 차분) + CRN
-설계공간에서 임의 방향 $e$에 대해:
-
-$$
-\Delta P(x; e)
-\approx
-\frac{
-P(\Pi(x+\sigma e))
+\nabla V^\top b\,dt
 +
-P(\Pi(x-\sigma e))
--
-2P(\Pi(x))
-}{
-\sigma^2\|e\|^2
-}
+\frac{1}{2}\mathrm{Tr}\!\Big(\sigma\sigma^\top \nabla^2 V\Big)\,dt
++
+\nabla V^\top \sigma\,dW_t.
 $$
 
-- $\Pi(\cdot)$: 이산/혼합 설계변수의 정수화·클램프 투영(코드에서 고정 규칙)
-- CRN(공통 난수): $\Pi(x),\Pi(x\pm\sigma e)$를 **같은 seed 규칙**로 평가해 분산을 줄임
-
-### 4.3 ES 업데이트에서의 사용(가중치로 곱함)
-레포 구현은 $\lvert \Delta P\rvert$가 큰 방향의 업데이트를 약하게 만든다.
+여기서 **2차 미분 항**이 바로
 
 $$
-w
+\frac{1}{2}\mathrm{Tr}\!\Big(\sigma\sigma^\top \nabla^2 V\Big)
+$$
+
+입니다. 만약 확산이 등방성이라서 \(\sigma\sigma^\top = 2\nu I\) (스칼라 \(\nu>0\))라면
+
+$$
+\frac{1}{2}\mathrm{Tr}(2\nu I \nabla^2 V)
 =
-\frac{1}{1+\lambda\lvert \Delta P\rvert},
-\qquad
-\hat g \leftarrow w\cdot \hat g
+\nu\,\mathrm{Tr}(\nabla^2 V)
+=
+\nu\,\Delta V.
 $$
 
-즉, LBO는 “문구”가 아니라 **업데이트 식에 직접 반영**된다.
+즉, **확률적 확산을 포함하면 라플라시안 \(\Delta V\)** 가 자연스럽게 등장합니다.
+이게 “확산이 곧 2차 미분(곡률)”이라는 핵심 연결고리입니다.
 
 ---
 
-## 5. 체크리스트(문서/코드 일치 조건)
-아래가 성립하면 “LBO를 제대로 쓴다”고 말할 수 있다.
-- $\Delta P$ 계산에 $P(\Pi(x))$(center)가 실제로 들어간다.
-- $\Delta P$가 update에 직접 반영된다(상쇄되지 않는다).
-- CRN으로 후보 비교 분산을 낮춘다.
-- 투영 규칙 $\Pi$가 실험 내에서 고정되어 있다.
+### 4. 왜 “라플라스–벨트라미(LBO)”인가? (좌표 불변성)
+위의 \(\Delta\)는 유클리드 공간(\(\mathbb{R}^n\))의 라플라시안입니다.
+하지만 상태/설계공간이 “굽은 공간(다양체)”로 모델링되어야 한다면, 좌표를 바꿔도 의미가 유지되는 연산자가 필요합니다.
+그때 쓰는 것이 라플라스–벨트라미 연산자 \(\Delta_g\)입니다.
+
+#### 4.1 정의(표준 형태)
+리만 다양체 \((\mathcal{M},g)\)에서 스칼라 함수 \(f\)에 대한 LBO는
+
+$$
+\Delta_g f := \mathrm{div}_g(\nabla_g f)
+$$
+
+로 정의됩니다. 좌표계 \((x^1,\ldots,x^n)\)에서의 전개식은 다음입니다.
+
+$$
+\Delta_g f
+=
+\frac{1}{\sqrt{|g|}}\partial_i\Big(\sqrt{|g|}\,g^{ij}\partial_j f\Big).
+$$
+
+- \(g^{ij}\)는 메트릭 행렬 \(g\)의 역행렬 성분
+- \(|g|\)는 \(\det(g)\)
+- 반복 인덱스는 합(sum)으로 약속
+
+유클리드 공간에서는 \(g=I\), \(|g|=1\)이므로 \(\Delta_g=\sum_i \partial_{ii}=\Delta\)로 돌아갑니다.
 
 ---
 
-## 참고(최소)
-- Fleming & Soner, *Controlled Markov Processes and Viscosity Solutions*
-- Øksendal, *Stochastic Differential Equations*
-- Jost, *Riemannian Geometry and Geometric Analysis* (Laplacian/Laplace–Beltrami)
+### 5. 설계공간에서의 LBO: “진짜 \(\Delta_g\)” 대신 “차분 기반 곡률 측정”
+이 프로젝트의 설계공간 \(x\)는 이산(패턴 ID, 유닛 수)과 연속(스탯) 변수가 섞여 있고, 코드에서 클램프/정수화를 거칩니다.
+따라서 엄밀한 의미의 매끄러운 다양체 \((\mathcal{X},g)\)를 직접 두고 \(\Delta_g\)를 계산하기보다, 다음 전략을 씁니다.
 
+> **승률 지형 \(P(x)\)** 가 “너무 뾰족한 방향(곡률 큰 방향)”을 탐지해, 그 방향 업데이트를 약화한다.
+
+이를 위해 2차 중앙 차분을 사용합니다.
+
+#### 5.1 1차원 중앙 차분 증명 스케치
+테일러 전개로
+
+$$
+f(x\pm h)=f(x)\pm h f'(x)+\frac{h^2}{2}f''(x)+O(h^3).
+$$
+
+따라서
+
+$$
+f(x+h)+f(x-h)-2f(x)=h^2 f''(x)+O(h^4)
+$$
+
+이고,
+
+$$
+f''(x)\approx \frac{f(x+h)+f(x-h)-2f(x)}{h^2}.
+$$
+
+즉 “양쪽을 더하면 1차항이 상쇄되고 2차항이 남는다”는 구조가 핵심입니다.
+
+#### 5.2 다차원에서의 방향 2차 미분(헤시안) 연결
+\(f:\mathbb{R}^d\to\mathbb{R}\)가 충분히 매끄럽고, 방향 벡터 \(e\in\mathbb{R}^d\)에 대해 테일러 전개를 쓰면
+
+$$
+f(x+\sigma e)
+=
+f(x)+\sigma\nabla f(x)^\top e+\frac{\sigma^2}{2}e^\top H(x)e+O(\sigma^3)
+$$
+
+이며 \(H(x)=\nabla^2 f(x)\)는 헤시안입니다. 같은 방식으로 \(f(x-\sigma e)\)를 더하면
+
+$$
+f(x+\sigma e)+f(x-\sigma e)-2f(x)
+=
+\sigma^2 e^\top H(x)e + O(\sigma^4).
+$$
+
+따라서
+
+$$
+\frac{f(x+\sigma e)+f(x-\sigma e)-2f(x)}{\sigma^2\|e\|^2}
+\approx
+\frac{e^\top H(x)e}{\|e\|^2}
+$$
+
+는 “그 방향의 곡률”을 근사합니다.
+
+#### 5.3 “라플라시안”과의 연결(등방성 방향 평균)
+만약 \(e\)가 등방성(isotropic) 분포에서 뽑히면(예: 표준정규), 위의 방향 곡률의 기대값은 \(\mathrm{Tr}(H)\)와 연결됩니다.
+정확한 상수는 분포/정규화에 따라 달라지지만, 요지는
+
+$$
+\mathbb{E}\Big[\frac{e^\top H e}{\|e\|^2}\Big]
+\propto
+\mathrm{Tr}(H)
+=
+\Delta f
+$$
+
+로 “방향 곡률을 평균내면 라플라시안”이 된다는 점입니다.
+프로젝트에서는 이 평균을 엄밀히 쓰기보다, 샘플별 \(|\Delta P|\)를 **안정성 지표**로 사용합니다.
+
+---
+
+### 6. 이 프로젝트에서의 사용: ES 업데이트를 “곡률로 가중”하기
+이 프로젝트의 핵심은 다음입니다.
+
+- 외부 목적은 승률/퇴화 방지/메타(거리 분포 등)로 구성된 \(J(x)\)이고(`docs/blackbox.md`)
+- ES는 \(x\pm\sigma e\)를 평가해 업데이트 방향을 얻는데
+- **승률 지형 \(P(x)\)** 의 곡률이 큰 샘플(불안정한 방향)은 업데이트에 덜 반영합니다.
+
+#### 6.1 설계공간 라플라시안(2차 차분) 근사
+2팩션 승률 \(P(x)\)에 대해 코드에서는 다음을 사용합니다.
+
+$$
+\Delta P(x)
+\approx
+\frac{P(x+\sigma e)+P(x-\sigma e)-2P(x)}{\sigma^2\|e\|^2}.
+$$
+
+다팩션의 경우 \(P\)가 행렬 \(W_{f,g}\)이므로, 각 쌍에 대해 위를 계산해 평균(또는 평균 절대값)을 사용합니다.
+
+#### 6.2 공통 난수(CRN)가 중요한 이유
+승률 추정 \(P(x;\omega)\)는 self-play/RL 노이즈가 큽니다.
+따라서 같은 방향 \(e\)에 대해 center/pos/neg를 **동일 시드(=CRN)** 로 평가하여,
+\(P(x+\sigma e)-P(x-\sigma e)\) 같은 “차이”의 분산을 낮춥니다.
+
+#### 6.3 가중치로 쓰는 방식(현재 구현)
+코드(`src/core/designer.py`)는
+
+$$
+w(e)=\frac{1}{1+\lambda\,|\Delta P(x)|}
+$$
+
+형태의 단순 가중치를 두고(\(\lambda\)는 현재 1.0), ES 그라디언트 누적에 곱합니다.
+직관적으로 \(|\Delta P|\)가 크면 “그 방향은 설계가 예민하다”는 뜻이므로, 업데이트를 약하게 만듭니다.
+
+---
+
+### 7. (부록) 그래프 라플라시안과 디리클레 에너지(토이 실험 모듈)
+`src/core/lbo.py`에는 그래프 라플라시안 \(L=D-W\)와 디리클레 에너지가 구현되어 있습니다.
+여기서 \(W\)는 대칭 가중치 행렬, \(D\)는 차수 행렬입니다(\(D_{ii}=\sum_j W_{ij}\)).
+
+#### 7.1 디리클레 에너지의 비음수성(증명 스케치)
+
+$$
+u^\top (D-W)u
+=
+\sum_i d_i u_i^2 - \sum_{i,j} w_{ij}u_i u_j.
+$$
+
+대칭 \(w_{ij}=w_{ji}\)를 가정하면,
+
+$$
+\frac{1}{2}\sum_{i,j} w_{ij}(u_i-u_j)^2
+=
+\frac{1}{2}\sum_{i,j} w_{ij}(u_i^2+u_j^2-2u_i u_j)
+=
+\sum_i d_i u_i^2 - \sum_{i,j} w_{ij}u_i u_j
+$$
+
+이므로
+
+$$
+\boxed{u^\top L u = \frac{1}{2}\sum_{i,j} w_{ij}(u_i-u_j)^2 \ge 0}
+$$
+
+가 됩니다(가중치 \(w_{ij}\ge 0\)). 이 성질은 테스트(`tests/test.py`)에서 간단히 확인합니다.
+
+---
+
+### 8. 실무 튜닝 포인트(설계/구현 관점)
+- \(\sigma\)가 너무 작으면: 이산/클램프 때문에 \(x+\sigma e\)와 \(x-\sigma e\)가 같은 설계로 투영되어 차분이 0이 되기 쉽습니다.
+- \(\sigma\)가 너무 크면: “국소 곡률”이 아니라 전역 비선형 변화까지 섞여 곡률 해석이 어려워집니다.
+- CRN은 필수에 가깝습니다: self-play 노이즈가 크기 때문에, 같은 seed로 center/pos/neg를 묶는 것이 분산 감소에 큰 도움이 됩니다.
+- 다팩션에서는 \(\Delta P\)를 행렬로 두고 요약해야 합니다(현재 구현은 쌍대결별 \(\Delta W_{i,j}\) 절대값 평균).

@@ -620,41 +620,25 @@ class GridCombatEnv:
         return occupied
 
     def _get_unit_obs(self, f: int, i: int) -> torch.Tensor:
-        # dead 유닛은 0벡터
-        if self.hps[f][i] <= 0:
-            return torch.zeros(8, dtype=torch.float32)
+        """
+        단일 유닛 관측을 반환합니다.
 
-        x, y = self.positions[f][i]
-        hp = self.hps[f][i]
-        hp_max = self.specs[f]["hp"]
+        - 현재 정책/학습 루프는 `_get_obs()`가 만드는 12차원 유닛 관측을 사용합니다.
+        - 과거 구현의 깨진 참조(self.specs, _nearest_enemy)를 제거하고, DRY하게 `_get_obs()` 결과를 재사용합니다.
+        """
+        try:
+            ff = int(f)
+            ii = int(i)
+        except Exception:
+            return torch.zeros(12, dtype=torch.float32)
 
-        enemy_i, d = self._nearest_enemy(f, (x, y))
-        if enemy_i is None:
-            dx = 0.0
-            dy = 0.0
-            dist = 0.0
-        else:
-            ex, ey = self.positions[1 - f][enemy_i]
-            dx = (ex - x) / max(1.0, float(self.width - 1))
-            dy = (ey - y) / max(1.0, float(self.height - 1))
-            dist = float(d) / max(1.0, float(self.width + self.height - 2))
+        if ff not in (0, 1):
+            return torch.zeros(12, dtype=torch.float32)
 
-        alive_self = len(self._alive_indices(f))
-        alive_enemy = len(self._alive_indices(1 - f))
-
-        return torch.tensor(
-            [
-                x / max(1.0, float(self.width - 1)),
-                y / max(1.0, float(self.height - 1)),
-                hp / max(1e-6, float(hp_max)),
-                dx,
-                dy,
-                dist,
-                alive_self / max(1.0, float(self.n_units[f])),
-                alive_enemy / max(1.0, float(self.n_units[1 - f])),
-            ],
-            dtype=torch.float32,
-        )
+        obs_all = self._get_obs()
+        if ii < 0 or ii >= len(obs_all[ff]):
+            return torch.zeros(12, dtype=torch.float32)
+        return obs_all[ff][ii]
 
     def _get_obs(self):
         # 파이썬 루프 최소화: nearest를 한 번에 계산하고 obs를 구성
@@ -726,199 +710,205 @@ class GridCombatEnv:
 
         return obs_all
 
-    def step(self, turn_action: Tuple[int, int, int]):
+    def _sanitize_turn_action(self, turn_action: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """
-        체스 룰: 교대 턴 + 턴당 1유닛만 행동.
-        turn_action = (f, unit_index, action)
-          - f: 현재 턴의 팩션(0 또는 1)이어야 함
-          - unit_index: 해당 팩션 유닛 인덱스
-          - action: 0~4 이동(정지/상/하/좌/우), 5 공격
-        """
-        rewards = [0.0, 0.0]
+        규칙 위반 입력을 최소한의 방식으로 정리합니다.
 
+        - 현재 턴의 진영이 아니면: (side_to_act, 0, 0)으로 강제
+        """
         f, i, a = int(turn_action[0]), int(turn_action[1]), int(turn_action[2])
-        if f != int(getattr(self, "side_to_act", 0)):
-            # 규칙 위반 입력은 정지로 처리
-            f = int(getattr(self, "side_to_act", 0))
-            i = 0
-            a = 0
+        side = int(getattr(self, "side_to_act", 0))
+        if f != side:
+            return side, 0, 0
+        return f, i, a
 
-        # 현재 점유 맵 구성(교대턴이지만 이동 충돌 체크용)
-        occupied = {}
-        for ff in (0, 1):
-            for ii in self._alive_indices(ff):
-                occupied[self.positions[ff][ii]] = (ff, ii)
-        for pos in getattr(self, "obstacles", set()):
-            occupied[pos] = (-1, -1)
+    def _is_alive_unit(self, f: int, i: int) -> bool:
+        if f not in (0, 1):
+            return False
+        if i < 0 or i >= int(self.n_units[f]):
+            return False
+        return float(self.hps[f][i]) > 0.0
 
-        # 1) 이동/정지: 현재 턴 유닛 1개만 처리
-        # 패턴 ID 기반 동적 이동 패턴 적용
-        attacks_this_step = 0
-        move_pattern = self._ORTHOGONAL  # 기본값
-        is_sliding = True
-        
-        if i in self._alive_indices(f):
-            t = int(self.unit_types[f][i])
-            pattern_id = int(self.typespecs[f][t].get("pattern", 0))
-            pattern_id = max(0, min(self.NUM_PATTERNS - 1, pattern_id))
-            move_pattern, is_sliding, pattern_name = self.MOVE_PATTERN_POOL[pattern_id]
-            move_range = int(max(1.0, round(self.typespecs[f][t]["move"])))
+    def _apply_turn_move(self, f: int, i: int, a: int, occupied: Dict[Tuple[int, int], Tuple[int, int]]) -> int:
+        """
+        현재 턴 유닛 1개의 이동(또는 정지)을 처리합니다.
 
-            # "forward_slide"는 팩션 진행 방향(좌↔우)을 따른다.
-            # 현재 배치 규칙은 f=0이 왼쪽, f=1이 오른쪽에서 시작하므로
-            # forward는 f=0:+x, f=1:-x로 정의한다.
-            if pattern_name == "forward_slide":
-                move_pattern = [(1, 0)] if f == 0 else [(-1, 0)]
-            
-            # action 0~N-1: 이동 방향 선택 (패턴에 따라 방향 수 다름)
-            # action >= 패턴 길이: 공격
-            if a < len(move_pattern):
-                dx, dy = move_pattern[a]
-                x, y = self.positions[f][i]
-                
-                if is_sliding:
-                    # 슬라이딩: 해당 방향으로 move_range칸까지, 경로 상 장애물 체크
-                    def try_slide(dir_dx: int, dir_dy: int) -> bool:
-                        nonlocal x, y
-                        for step in range(move_range, 0, -1):
-                            nx = int(max(0, min(self.width - 1, x + dir_dx * step)))
-                            ny = int(max(0, min(self.height - 1, y + dir_dy * step)))
-                            if (nx, ny) == (x, y):
-                                continue
-                            # 경로 상 장애물 체크
-                            blocked = False
-                            for s in range(1, step + 1):
-                                check_x = int(x + dir_dx * s)
-                                check_y = int(y + dir_dy * s)
-                                if (check_x, check_y) in occupied:
-                                    blocked = True
-                                    break
-                            if blocked:
-                                continue
-                            if (nx, ny) in occupied:
-                                continue
-                            del occupied[(x, y)]
-                            occupied[(nx, ny)] = (f, i)
-                            self.positions[f][i] = (nx, ny)
-                            return True
-                        return False
+        반환값은 "현재 유닛의 이동 패턴 길이"이며, step()에서 공격 판정(a >= len(move_pattern))에 사용합니다.
+        """
+        t = int(self.unit_types[f][i])
+        pattern_id = int(self.typespecs[f][t].get("pattern", 0))
+        pattern_id = max(0, min(self.NUM_PATTERNS - 1, pattern_id))
+        move_pattern, is_sliding, pattern_name = self.MOVE_PATTERN_POOL[pattern_id]
+        move_range = int(max(1.0, round(self.typespecs[f][t]["move"])))
 
-                    moved = try_slide(dx, dy)
-                    if not moved:
-                        other_dirs = list(move_pattern)
-                        self.rng.shuffle(other_dirs)
-                        for odx, ody in other_dirs:
-                            if (odx, ody) == (dx, dy):
-                                continue
-                            if try_slide(odx, ody):
-                                break
-                else:
-                    # 점프: 정확히 (dx, dy) 위치로 이동, 장애물 무시
-                    # move_range만큼 반복 점프 가능
-                    for _ in range(move_range):
-                        nx = int(x + dx)
-                        ny = int(y + dy)
-                        if 0 <= nx < self.width and 0 <= ny < self.height and (nx, ny) not in occupied:
-                            del occupied[(x, y)]
-                            occupied[(nx, ny)] = (f, i)
-                            self.positions[f][i] = (nx, ny)
-                            x, y = nx, ny
-                        else:
-                            # 원래 방향 막히면 다른 방향 시도
-                            tried_other = False
-                            other_dirs = list(move_pattern)
-                            self.rng.shuffle(other_dirs)
-                            for odx, ody in other_dirs:
-                                if (odx, ody) == (dx, dy):
-                                    continue
-                                onx = int(x + odx)
-                                ony = int(y + ody)
-                                if 0 <= onx < self.width and 0 <= ony < self.height and (onx, ony) not in occupied:
-                                    del occupied[(x, y)]
-                                    occupied[(onx, ony)] = (f, i)
-                                    self.positions[f][i] = (onx, ony)
-                                    x, y = onx, ony
-                                    tried_other = True
-                                    break
-                            if not tried_other:
-                                break
+        # "forward_slide"는 팩션 진행 방향(좌↔우)을 따른다.
+        if pattern_name == "forward_slide":
+            move_pattern = [(1, 0)] if f == 0 else [(-1, 0)]
 
-        # 2) 공격 처리: 현재 턴 유닛 1개만 처리
-        # action이 이동 패턴 길이 이상이면 공격
-        nearest_idx, nearest_dist = self._nearest_enemy_all()
-        is_attack_action = (a >= len(move_pattern)) if i in self._alive_indices(f) else False
-        if is_attack_action and i in self._alive_indices(f):
-            t = int(self.unit_types[f][i])
-            dmg = float(self.typespecs[f][t]["damage"])
-            targets = self._attack_targets(f, i, occupied)
-            if targets:
-                # 가장 가까운(맨해튼) 적을 자동 선택
-                x0, y0 = self.positions[f][i]
-                best = None
-                best_d = None
-                for def_f, enemy_i in targets:
-                    ex, ey = self.positions[def_f][enemy_i]
-                    d = self._manhattan((x0, y0), (ex, ey))
-                    if best_d is None or d < best_d:
-                        best_d = d
-                        best = (def_f, enemy_i)
-                if best is not None and best_d is not None:
-                    def_f, enemy_i = int(best[0]), int(best[1])
-                    self.hps[def_f][enemy_i] -= dmg
-                    rewards[f] += dmg
-                    rewards[def_f] -= dmg
-                    self.history["attack_distances"].append(float(best_d))
-                    attacks_this_step = 1
-                    self.any_attack = True
+        move_len = int(len(move_pattern))
+        if a >= move_len:
+            return move_len
 
-                    # 킹 사망 체크: 공격받은 유닛이 킹이고 HP <= 0이면 즉시 패배
-                    if self.unit_types[def_f][enemy_i] == self.king_type_idx and self.hps[def_f][enemy_i] <= 0:
-                        self.king_dead[def_f] = True
+        dx, dy = move_pattern[a]
+        x0, y0 = self.positions[f][i]
 
-        # 2-b) 거리 쉐이핑 보상(접근 유도): 살아있는 유닛들의 최근접 적 거리 평균을 줄이면 보상
-        # 벡터화된 nearest_dist를 사용하므로 오버헤드가 거의 없음
+        def relocate(nx: int, ny: int) -> None:
+            old = (int(x0), int(y0))
+            new = (int(nx), int(ny))
+            # step()의 호출자는 occupied 충돌을 미리 체크한다.
+            if old in occupied:
+                del occupied[old]
+            occupied[new] = (f, i)
+            self.positions[f][i] = new
+
+        def path_blocked(dir_dx: int, dir_dy: int, steps: int) -> bool:
+            # 기존 구현과 동일: 중간 경로에 occupied(유닛/장애물)가 있으면 blocked로 본다.
+            for s in range(1, int(steps) + 1):
+                check_x = int(x0 + dir_dx * s)
+                check_y = int(y0 + dir_dy * s)
+                if (check_x, check_y) in occupied:
+                    return True
+            return False
+
+        if is_sliding:
+            # 슬라이딩: 해당 방향으로 move_range칸까지, 경로 상 장애물 체크
+            def try_slide(dir_dx: int, dir_dy: int) -> bool:
+                for step in range(int(move_range), 0, -1):
+                    nx = int(max(0, min(self.width - 1, x0 + dir_dx * step)))
+                    ny = int(max(0, min(self.height - 1, y0 + dir_dy * step)))
+                    if (nx, ny) == (x0, y0):
+                        continue
+                    if path_blocked(dir_dx, dir_dy, step):
+                        continue
+                    if (nx, ny) in occupied:
+                        continue
+                    relocate(nx, ny)
+                    return True
+                return False
+
+            moved = try_slide(int(dx), int(dy))
+            if not moved:
+                other_dirs = list(move_pattern)
+                self.rng.shuffle(other_dirs)
+                for odx, ody in other_dirs:
+                    if (int(odx), int(ody)) == (int(dx), int(dy)):
+                        continue
+                    if try_slide(int(odx), int(ody)):
+                        break
+            return move_len
+
+        # 점프: 정확히 (dx, dy) 위치로 이동, 장애물 무시
+        x, y = int(x0), int(y0)
+        for _ in range(int(move_range)):
+            nx = int(x + dx)
+            ny = int(y + dy)
+            if 0 <= nx < self.width and 0 <= ny < self.height and (nx, ny) not in occupied:
+                # 기존 위치 제거 후 새 위치 등록
+                if (x, y) in occupied:
+                    del occupied[(x, y)]
+                occupied[(nx, ny)] = (f, i)
+                self.positions[f][i] = (nx, ny)
+                x, y = nx, ny
+                continue
+
+            # 원래 방향 막히면 다른 방향 시도
+            other_dirs = list(move_pattern)
+            self.rng.shuffle(other_dirs)
+            tried_other = False
+            for odx, ody in other_dirs:
+                if (int(odx), int(ody)) == (int(dx), int(dy)):
+                    continue
+                onx = int(x + odx)
+                ony = int(y + ody)
+                if 0 <= onx < self.width and 0 <= ony < self.height and (onx, ony) not in occupied:
+                    if (x, y) in occupied:
+                        del occupied[(x, y)]
+                    occupied[(onx, ony)] = (f, i)
+                    self.positions[f][i] = (onx, ony)
+                    x, y = onx, ony
+                    tried_other = True
+                    break
+            if not tried_other:
+                break
+
+        return move_len
+
+    def _apply_turn_attack(self, f: int, i: int, occupied: Dict[Tuple[int, int], Tuple[int, int]], rewards: List[float]) -> int:
+        """
+        현재 턴 유닛 1개의 공격을 처리합니다.
+        반환: 이번 step에서 공격이 실제로 발생했는지(0 또는 1)
+        """
+        t = int(self.unit_types[f][i])
+        dmg = float(self.typespecs[f][t]["damage"])
+        targets = self._attack_targets(f, i, occupied)
+        if not targets:
+            return 0
+
+        # 가장 가까운(맨해튼) 적을 자동 선택
+        x0, y0 = self.positions[f][i]
+        best = None
+        best_d = None
+        for def_f, enemy_i in targets:
+            ex, ey = self.positions[def_f][enemy_i]
+            d = self._manhattan((x0, y0), (ex, ey))
+            if best_d is None or d < best_d:
+                best_d = d
+                best = (def_f, enemy_i)
+
+        if best is None or best_d is None:
+            return 0
+
+        def_f, enemy_i = int(best[0]), int(best[1])
+        self.hps[def_f][enemy_i] -= dmg
+        rewards[f] += dmg
+        rewards[def_f] -= dmg
+        self.history["attack_distances"].append(float(best_d))
+        self.any_attack = True
+
+        # 킹 사망 체크: 공격받은 유닛이 킹이고 HP <= 0이면 즉시 패배
+        if self.unit_types[def_f][enemy_i] == self.king_type_idx and self.hps[def_f][enemy_i] <= 0:
+            self.king_dead[def_f] = True
+
+        return 1
+
+    def _apply_distance_shaping(self, rewards: List[float], nearest_dist: List[np.ndarray]) -> None:
+        """
+        접근 유도 shaping: 살아있는 유닛들의 최근접 적 거리 평균을 줄이면 보상(+), 늘리면 패널티(-).
+        """
         shaping_scale = float(self.config.get("shaping_scale", 0.02))
-        for f in (0, 1):
-            alive = self._alive_indices(f)
+        for ff in (0, 1):
+            alive = self._alive_indices(ff)
             if len(alive) == 0:
                 continue
-            # dead는 0, alive는 거리값이 들어있음
-            avg_d = float(np.mean(nearest_dist[f][alive])) if len(alive) else 0.0
+            avg_d = float(np.mean(nearest_dist[ff][alive])) if len(alive) else 0.0
             if self._prev_avg_d is None:
                 self._prev_avg_d = [avg_d, avg_d]
             prev = self._prev_avg_d
-            # 거리 감소 -> +, 증가 -> -
-            rewards[f] += shaping_scale * (prev[f] - avg_d)
-            prev[f] = avg_d
+            rewards[ff] += shaping_scale * (prev[ff] - avg_d)
+            prev[ff] = avg_d
             self._prev_avg_d = prev
 
-        # 2-c) 무교전 조기 종료용 카운터
-        if attacks_this_step == 0:
-            self.no_attack_steps += 1
-        else:
-            self.no_attack_steps = 0
-
-        self.step_idx += 1
-        # 다음 턴으로
-        self.side_to_act = 1 - int(getattr(self, "side_to_act", 0))
-
+    def _resolve_terminal(self, rewards: List[float]) -> Tuple[bool, int | None, int, int]:
         done = False
-        winner = None
+        winner: int | None = None
         alive0 = len(self._alive_indices(0))
         alive1 = len(self._alive_indices(1))
-        
+
         # 킹 사망 체크: 킹이 죽으면 즉시 패배 (체스처럼)
         if getattr(self, "king_dead", [False, False])[0]:
             done = True
             winner = 1
             rewards[1] += 20.0
             rewards[0] -= 20.0
-        elif getattr(self, "king_dead", [False, False])[1]:
+            return done, winner, alive0, alive1
+        if getattr(self, "king_dead", [False, False])[1]:
             done = True
             winner = 0
             rewards[0] += 20.0
             rewards[1] -= 20.0
-        elif alive0 == 0 or alive1 == 0:
+            return done, winner, alive0, alive1
+
+        if alive0 == 0 or alive1 == 0:
             done = True
             if alive0 > alive1:
                 winner = 0
@@ -930,19 +920,17 @@ class GridCombatEnv:
                 rewards[0] -= 10.0
             else:
                 winner = -1
+            return done, winner, alive0, alive1
+
         # 무교전이 일정 턴 지속되면 조기 종료 + 큰 페널티(퇴화 방지)
         no_attack_limit = int(self.config.get("no_attack_limit", 20))
-        if not done and self.no_attack_steps >= no_attack_limit:
+        if self.no_attack_steps >= no_attack_limit:
             done = True
-            # 체스/장기류의 턴제에서는 "무교전"을 전력으로 판정하면
-            # 유닛 수 비대칭이 곧바로 승률 편향으로 고정됩니다.
-            # 무교전(공격 0회)이라면 draw로 처리하고, 디자이너 쪽 페널티로 퇴화를 끊습니다.
             if not self.any_attack:
                 winner = -1
                 rewards[0] -= 2.0
                 rewards[1] -= 2.0
             else:
-                # 교전이 있었으면 남은 전력(유닛 수/총 HP)으로 승부
                 hp0 = float(sum(max(0.0, hp) for hp in self.hps[0]))
                 hp1 = float(sum(max(0.0, hp) for hp in self.hps[1]))
                 if alive0 > alive1 or (alive0 == alive1 and hp0 > hp1):
@@ -957,16 +945,15 @@ class GridCombatEnv:
                     winner = -1
                     rewards[0] -= 2.0
                     rewards[1] -= 2.0
+            return done, winner, alive0, alive1
 
-        elif self.step_idx >= self.max_steps:
+        if self.step_idx >= self.max_steps:
             done = True
-            # 시간초과도 무교전이면 draw (유닛 수 비대칭 고정 승패 방지)
             if not self.any_attack:
                 winner = -1
                 rewards[0] -= 1.0
                 rewards[1] -= 1.0
             else:
-                # 교전이 있었으면 남은 전력으로 승부
                 if alive0 > alive1:
                     winner = 0
                     rewards[0] += 2.0
@@ -988,6 +975,55 @@ class GridCombatEnv:
                         rewards[0] -= 1.0
                     else:
                         winner = -1
+            return done, winner, alive0, alive1
+
+        return done, winner, alive0, alive1
+
+    def _scale_rewards(self, rewards: List[float]) -> None:
+        # 보상 스케일 정규화: 팩션별 초기 유닛 수로 나눠 학습 스케일을 맞춘다.
+        scale0 = 1.0 / float(max(1, int(self.n_units[0])))
+        scale1 = 1.0 / float(max(1, int(self.n_units[1])))
+        rewards[0] = float(rewards[0]) * scale0
+        rewards[1] = float(rewards[1]) * scale1
+
+    def step(self, turn_action: Tuple[int, int, int]):
+        """
+        체스 룰: 교대 턴 + 턴당 1유닛만 행동.
+        turn_action = (f, unit_index, action)
+          - f: 현재 턴의 팩션(0 또는 1)이어야 함
+          - unit_index: 해당 팩션 유닛 인덱스
+          - action: 0~4 이동(정지/상/하/좌/우), 5 공격
+        """
+        rewards = [0.0, 0.0]
+
+        f, i, a = self._sanitize_turn_action(turn_action)
+        occupied = self._build_occupied_map()
+
+        attacks_this_step = 0
+        move_len = 0
+        if self._is_alive_unit(f, i):
+            move_len = self._apply_turn_move(f, i, a, occupied)
+
+        # nearest는 "이동 이후"를 기준으로 한 번만 계산한다. (기존 구현과 동일한 타이밍)
+        _, nearest_dist = self._nearest_enemy_all()
+
+        # 공격: action >= move_pattern_len
+        if self._is_alive_unit(f, i) and a >= int(move_len):
+            attacks_this_step = self._apply_turn_attack(f, i, occupied, rewards)
+
+        self._apply_distance_shaping(rewards, nearest_dist)
+
+        # 무교전 조기 종료용 카운터
+        if attacks_this_step == 0:
+            self.no_attack_steps += 1
+        else:
+            self.no_attack_steps = 0
+
+        self.step_idx += 1
+        # 다음 턴으로
+        self.side_to_act = 1 - int(getattr(self, "side_to_act", 0))
+
+        done, winner, alive0, alive1 = self._resolve_terminal(rewards)
 
         info = {
             "winner": winner,
@@ -997,13 +1033,7 @@ class GridCombatEnv:
             "side_to_act": int(getattr(self, "side_to_act", 0)),
         }
 
-        # 보상 스케일 정규화:
-        # 유닛 수가 많은 팩션은 "같은 행동 품질"이라도 공격 기회/보상 합이 더 커져 학습이 유리해집니다.
-        # 팩션별 초기 유닛 수로 나눠 학습 스케일을 맞춥니다. (평가 통계에는 영향 없음: 승률/거리만 사용)
-        scale0 = 1.0 / float(max(1, int(self.n_units[0])))
-        scale1 = 1.0 / float(max(1, int(self.n_units[1])))
-        rewards[0] = float(rewards[0]) * scale0
-        rewards[1] = float(rewards[1]) * scale1
+        self._scale_rewards(rewards)
 
         return self._get_obs(), rewards, done, info
 

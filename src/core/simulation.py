@@ -1,8 +1,53 @@
-import torch
+from __future__ import annotations
+
 import numpy as np
+import torch
+from typing import Any, Dict, List, Tuple
 from src.envs.simple_combat import GridCombatEnv
 from src.core.agent import SimplePolicy, train_one_episode, get_turn_action_with_env
 from itertools import combinations
+
+POLICY_LR = 0.01
+
+
+def _set_seeds(seed: int) -> None:
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+
+
+def _first_turn(ep: int, total_episodes: int) -> int:
+    # 선턴 공정성: 절반은 0이 선턴, 절반은 1이 선턴
+    return 0 if int(ep) < int(total_episodes) // 2 else 1
+
+
+def _train_self_play(env: GridCombatEnv, policies: List[SimplePolicy], optimizers: List[torch.optim.Optimizer], train_episodes: int) -> None:
+    for ep in range(int(train_episodes)):
+        train_one_episode(env, policies, optimizers, first_turn=_first_turn(ep, int(train_episodes)))
+
+
+def _eval_self_play(env: GridCombatEnv, policies: List[SimplePolicy], eval_episodes: int) -> Tuple[Dict[int, int], List[float]]:
+    win_counts: Dict[int, int] = {0: 0, 1: 0, -1: 0}
+    all_attack_distances: List[float] = []
+
+    with torch.no_grad():
+        for ep in range(int(eval_episodes)):
+            obs = env.reset(first_turn=_first_turn(ep, int(eval_episodes)))
+            done = False
+            while not done:
+                obs0_units, obs1_units = obs
+                side = int(getattr(env, "side_to_act", 0))
+                if side == 0:
+                    ui, a, _ = get_turn_action_with_env(policies[0], env, 0, obs0_units)
+                    obs, _, done, info = env.step((0, ui, a))
+                else:
+                    ui, a, _ = get_turn_action_with_env(policies[1], env, 1, obs1_units)
+                    obs, _, done, info = env.step((1, ui, a))
+
+            win_counts[int(info["winner"])] += 1
+            all_attack_distances.extend(info.get("attack_distances", []))
+
+    return win_counts, all_attack_distances
+
 
 def run_simulation(design_params: dict, train_episodes=50, eval_episodes=20, seed=42):
     """
@@ -15,43 +60,21 @@ def run_simulation_pair(design_params: dict, factions: tuple, train_episodes=50,
     특정 팩션 쌍 시뮬레이션
     factions: (f0, f1) 팩션 ID 쌍
     """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    _set_seeds(int(seed))
     
     env = GridCombatEnv(design_params, seed=seed, factions=factions)
     
     # 두 에이전트 초기화
     policies = [SimplePolicy(), SimplePolicy()]
-    optimizers = [torch.optim.Adam(p.parameters(), lr=0.01) for p in policies]
+    optimizers = [torch.optim.Adam(p.parameters(), lr=float(POLICY_LR)) for p in policies]
     
     # 내부 루프: 학습
-    for ep in range(train_episodes):
-        first_turn = 0 if ep < train_episodes // 2 else 1
-        train_one_episode(env, policies, optimizers, first_turn=first_turn)
+    _train_self_play(env, policies, optimizers, int(train_episodes))
         
     # 평가
-    win_counts = {0: 0, 1: 0, -1: 0}
-    all_attack_distances = []
+    win_counts, all_attack_distances = _eval_self_play(env, policies, int(eval_episodes))
     
-    with torch.no_grad():
-        for ep in range(eval_episodes):
-            first_turn = 0 if ep < eval_episodes // 2 else 1
-            obs = env.reset(first_turn=first_turn)
-            done = False
-            while not done:
-                obs0_units, obs1_units = obs
-                side = int(getattr(env, "side_to_act", 0))
-                if side == 0:
-                    ui, a, _ = get_turn_action_with_env(policies[0], env, 0, obs0_units)
-                    obs, _, done, info = env.step((0, ui, a))
-                else:
-                    ui, a, _ = get_turn_action_with_env(policies[1], env, 1, obs1_units)
-                    obs, _, done, info = env.step((1, ui, a))
-                
-            win_counts[info["winner"]] += 1
-            all_attack_distances.extend(info.get("attack_distances", []))
-    
-    total = eval_episodes
+    total = int(eval_episodes)
     f0_win_rate = win_counts[0] / total
     f1_win_rate = win_counts[1] / total
     

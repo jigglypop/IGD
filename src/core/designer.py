@@ -1,31 +1,56 @@
+import math
 import numpy as np
 import torch
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 from src.core.simulation import run_simulation, run_simulation_all_pairs
 
 def wasserstein_distance_1d(u_values, v_values):
     """
-    1차원 Wasserstein 거리 (Earth Mover's Distance)
-    Scipy의 wasserstein_distance와 동일 로직의 간단 구현
+    1차원 경험분포 간 2-Wasserstein 거리의 제곱(W2^2) 근사.
+
+    1D에서 동일 가중치 표본(경험분포)은 정렬 후 평균 제곱차로 W2^2를 계산할 수 있습니다.
+    (관련 설명: docs/blackbox.md, docs/evaluation.md)
     """
-    u_sorted = np.sort(u_values)
-    v_sorted = np.sort(v_values)
+    u_sorted = np.sort(np.asarray(u_values, dtype=np.float64))
+    v_sorted = np.sort(np.asarray(v_values, dtype=np.float64))
     
-    if len(u_sorted) == 0 or len(v_sorted) == 0:
+    if u_sorted.size == 0 or v_sorted.size == 0:
         return 0.0
 
     # 샘플 수가 다르면 보간법 사용해야 하나, 여기서는 편의상 샘플링으로 맞춤
-    min_len = min(len(u_sorted), len(v_sorted))
+    min_len = int(min(int(u_sorted.size), int(v_sorted.size)))
     if min_len <= 0:
         return 0.0
     # 균등 간격으로 샘플링하여 길이 맞춤
-    u_indices = np.linspace(0, len(u_sorted)-1, min_len).astype(int)
-    v_indices = np.linspace(0, len(v_sorted)-1, min_len).astype(int)
+    u_indices = np.linspace(0, int(u_sorted.size) - 1, min_len).astype(np.int64)
+    v_indices = np.linspace(0, int(v_sorted.size) - 1, min_len).astype(np.int64)
     
     u_resampled = u_sorted[u_indices]
     v_resampled = v_sorted[v_indices]
     
-    return np.mean(np.abs(u_resampled - v_resampled))
+    diff = u_resampled - v_resampled
+    return float(np.mean(diff * diff))
+
+
+def _normal_quantiles(*, mean: float, std: float, n: int, clamp_min: float | None = None) -> np.ndarray:
+    """
+    재현 가능한 목표 분포 표본 생성:
+    - 난수 샘플링 대신, (0,1) 균등 격자 quantile을 정규분포 inverse-CDF로 변환합니다.
+    - SciPy 없이 torch.erfinv를 사용합니다.
+    """
+    if n <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    if std <= 0:
+        raise ValueError("std must be > 0")
+
+    with torch.no_grad():
+        # (0,1)에서 0/1을 피하는 균등 격자: (i+0.5)/n
+        p = (torch.arange(int(n), dtype=torch.float64) + 0.5) / float(n)
+        z = math.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0)  # Φ^{-1}(p)
+        q = float(mean) + float(std) * z
+        if clamp_min is not None:
+            q = torch.clamp(q, min=float(clamp_min))
+        return q.cpu().numpy().astype(np.float64, copy=False)
 
 from tqdm import tqdm
 import concurrent.futures
@@ -170,9 +195,11 @@ class DesignOptimizer:
         
         # 2. 분포 정합 손실: Wasserstein 거리
         dist_samples = stats.get("distance_samples", [])
-        target_samples = np.random.normal(self.target_dist_mean, 1.0, size=len(dist_samples))
-        target_samples = np.clip(target_samples, 0, None)
-        w2_dist = wasserstein_distance_1d(dist_samples, target_samples)
+        if dist_samples:
+            target_samples = _normal_quantiles(mean=float(self.target_dist_mean), std=1.0, n=len(dist_samples), clamp_min=0.0)
+            w2_dist = wasserstein_distance_1d(dist_samples, target_samples)
+        else:
+            w2_dist = 0.0
 
         # 2-b. 교전이 아예 없으면 강한 페널티
         no_engagement_penalty = 0.0
@@ -353,38 +380,45 @@ class DesignOptimizer:
             stats_n = run_simulation(design_neg, train_episodes=self.train_episodes, eval_episodes=self.eval_episodes, seed=seed)
         return stats_c, stats_p, stats_n
 
-    def step(self, step_index: int = 0):
-        # ES (Score Function Estimator)
-        # J_sigma(x) ~ E[J(x + sigma*epsilon)]
-        
-        gradients = {k: 0.0 for k in self.optimizable_keys}
-        results = []
-        
-        # Antithetic Sampling (대칭 샘플링)
-        # epsilon, -epsilon 쌍으로 샘플링
-        pairs = []
-        epsilons = []
-        for i in range(self.n_samples // 2):
+    def _sample_antithetic_pairs(self, step_index: int) -> Tuple[List[Tuple[int, Dict[str, float], Dict[str, float], int]], List[Dict[str, float]]]:
+        """
+        Antithetic sampling(+/-)을 구성합니다.
+        반환:
+          - pairs: (sample_index, design_pos, design_neg, seed)
+          - epsilons: epsilon 벡터(dict) 목록 (index로 접근)
+        """
+        pairs: List[Tuple[int, Dict[str, float], Dict[str, float], int]] = []
+        epsilons: List[Dict[str, float]] = []
+
+        half = int(self.n_samples // 2)
+        for i in range(half):
             epsilon = {k: float(np.random.randn()) for k in self.optimizable_keys}
             epsilons.append(epsilon)
 
             design_pos = self.mean_design.copy()
             design_neg = self.mean_design.copy()
             for k in self.optimizable_keys:
-                base_p = float(design_pos.get(k, 0.0))
-                base_n = float(design_neg.get(k, 0.0))
-                design_pos[k] = base_p + self.sigma * epsilon[k]
-                design_neg[k] = base_n - self.sigma * epsilon[k]
+                base = float(self.mean_design.get(k, 0.0))
+                design_pos[k] = base + float(self.sigma) * float(epsilon[k])
+                design_neg[k] = base - float(self.sigma) * float(epsilon[k])
 
-            # 정수/범위 클램프
             design_pos = self._clamp_design(design_pos)
             design_neg = self._clamp_design(design_neg)
 
-            # CRN(공통 난수): 같은 pair는 같은 seed로 평가 (분산 감소)
             seed = int(self.base_seed + step_index * 1000 + i)
             pairs.append((i, design_pos, design_neg, seed))
 
-        # tqdm: "후보 평가 완료 수" 기준으로 바로 움직이게 함 (pos/neg 2개씩이 아니라 pair 단위)
+        return pairs, epsilons
+
+    def _evaluate_triplets(self, pairs: List[Tuple[int, Dict[str, float], Dict[str, float], int]]):
+        """
+        center/pos/neg를 같은 seed(CRN)로 평가합니다.
+        반환: (sample_index, stats_center, stats_pos, stats_neg) 목록(정렬됨)
+        """
+        if not pairs:
+            return []
+
+        # tqdm: pair 단위로 진행률 표시
         pbar = tqdm(total=len(pairs), desc="ES Eval", leave=False)
 
         def _serial_eval():
@@ -395,10 +429,9 @@ class DesignOptimizer:
                 pbar.update(1)
             return out
 
-        # 다팩션이면 run_simulation_all_pairs 사용
         n_factions = int(self.mean_design.get("n_factions", 2))
         sim_func = run_simulation_all_pairs if n_factions > 2 else run_simulation
-        
+
         eval_results = []
         if self.use_parallel and self.max_workers > 1:
             try:
@@ -407,14 +440,18 @@ class DesignOptimizer:
                         ex.submit(sim_func, self.mean_design, self.train_episodes, self.eval_episodes, seed): (i, "center")
                         for i, _, _, seed in pairs
                     }
-                    futures.update({
-                        ex.submit(sim_func, dpos, self.train_episodes, self.eval_episodes, seed): (i, "pos")
-                        for i, dpos, _, seed in pairs
-                    })
-                    futures.update({
-                        ex.submit(sim_func, dneg, self.train_episodes, self.eval_episodes, seed): (i, "neg")
-                        for i, _, dneg, seed in pairs
-                    })
+                    futures.update(
+                        {
+                            ex.submit(sim_func, dpos, self.train_episodes, self.eval_episodes, seed): (i, "pos")
+                            for i, dpos, _, seed in pairs
+                        }
+                    )
+                    futures.update(
+                        {
+                            ex.submit(sim_func, dneg, self.train_episodes, self.eval_episodes, seed): (i, "neg")
+                            for i, _, dneg, seed in pairs
+                        }
+                    )
 
                     tmp: Dict[int, Dict[str, Any]] = {}
                     done_pair = {i: 0 for i, _, _, _ in pairs}
@@ -435,18 +472,31 @@ class DesignOptimizer:
 
         pbar.close()
         eval_results.sort(key=lambda x: x[0])
+        return eval_results
 
+    def _accumulate_es_gradients(
+        self,
+        eval_results: list,
+        epsilons: List[Dict[str, float]],
+    ) -> Tuple[Dict[str, float], list]:
+        """
+        평가 결과를 ES 그라디언트 누적과 로깅용 결과로 변환합니다.
+        반환:
+          - gradients: optimizable_keys별 누적 그라디언트(sum)
+          - results: (loss_pos, loss_neg, lbo) 목록
+        """
+        gradients = {k: 0.0 for k in self.optimizable_keys}
+        results = []
+
+        inv_denom = 1.0 / float(2.0 * float(self.sigma))
         for i, stats_center, stats_pos, stats_neg in eval_results:
-            epsilon = epsilons[i]
+            epsilon = epsilons[int(i)]
             eps_norm2 = float(sum(float(v) * float(v) for v in epsilon.values()))
 
             loss_pos = self.get_loss(stats_pos)
             loss_neg = self.get_loss(stats_neg)
 
-            # LBO(설계공간 라플라시안) 기반 곡률: 곡률이 큰 방향은 업데이트를 약하게(=안정 설계 선호)
             lbo = self.get_lbo_curvature(stats_center, stats_pos, stats_neg, eps_norm2=eps_norm2)
-            # 가중치(단순): 1 / (1 + λ * |ΔP|)
-            # λ는 차후 튜닝 가능. 우선 1.0으로 시작.
             lbo_w = 1.0 / (1.0 + 1.0 * float(lbo))
 
             if self.verbose:
@@ -459,18 +509,28 @@ class DesignOptimizer:
                     f"P1={stats_neg['p1_win_rate']:.2f} Draw={stats_neg['draw_rate']:.2f} Dist={stats_neg['avg_distance']:.2f}"
                 )
 
-            diff = loss_pos - loss_neg
+            diff = float(loss_pos) - float(loss_neg)
             for k in self.optimizable_keys:
-                gradients[k] += float(lbo_w) * diff * epsilon[k] / (2 * self.sigma)
+                gradients[k] += float(lbo_w) * diff * float(epsilon[k]) * inv_denom
 
             results.append((loss_pos, loss_neg, lbo))
-            
+
+        return gradients, results
+
+    def step(self, step_index: int = 0):
+        # ES (Score Function Estimator)
+        # J_sigma(x) ~ E[J(x + sigma*epsilon)]
+        pairs, epsilons = self._sample_antithetic_pairs(step_index=step_index)
+        eval_results = self._evaluate_triplets(pairs)
+        gradients, results = self._accumulate_es_gradients(eval_results, epsilons)
+
         # 평균 그라디언트로 업데이트
-        avg_grad = {k: v / (self.n_samples // 2) for k, v in gradients.items()}
-        
+        denom = float(max(1, int(self.n_samples // 2)))
+        avg_grad = {k: float(v) / denom for k, v in gradients.items()}
+
         for k in self.optimizable_keys:
             base = float(self.mean_design.get(k, 0.0))
-            self.mean_design[k] = base - self.lr * float(avg_grad[k])
+            self.mean_design[k] = base - float(self.lr) * float(avg_grad[k])
 
         # mean 자체도 클램프 (폭주/0으로 붕괴 방지)
         self.mean_design = self._clamp_design(self.mean_design)
