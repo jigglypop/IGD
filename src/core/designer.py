@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from typing import Dict, Any, Tuple, List
 from src.core.simulation import run_simulation, run_simulation_all_pairs
-from src.core.metric import ring as metric_ring, update as update_metric
+from src.core.metric import update as update_metric
 from src.core.lbo import laplacian_mul
 
 def wasserstein_distance_1d(u_values, v_values):
@@ -85,6 +85,8 @@ class DesignOptimizer:
         metric_decay: float = 0.01,
         metric_w_max: float = 1.0,
         metric_beta: float = 0.15,
+        metric_steps: int = 2,
+        lbo_ema_decay: float = 0.97,
     ):
         self.mean_design = initial_design.copy()
         self.target_dist_mean = target_dist_mean
@@ -104,6 +106,10 @@ class DesignOptimizer:
         self.metric_decay = float(metric_decay)
         self.metric_w_max = float(metric_w_max)
         self.metric_beta = float(metric_beta)
+        self.metric_steps = int(metric_steps)
+        self.lbo_ema_decay = float(lbo_ema_decay)
+        self._ema_lbo_win: float | None = None
+        self._ema_lbo_loss: float | None = None
 
         if max_workers and max_workers > 0:
             self.max_workers = max_workers
@@ -188,8 +194,88 @@ class DesignOptimizer:
         # - 메트릭은 Hebbian-like rule(metric.update)로 갱신
         # - 업데이트 벡터(그라디언트)에 diffusion(-L g)을 걸어 "수로처럼" 안정된 방향으로 흐르게 함
         self._metric_w: np.ndarray | None = None
+        self._metric_mask: np.ndarray | None = None
         if self.use_metric_lbo and len(self.optimizable_keys) > 2:
-            self._metric_w = metric_ring(len(self.optimizable_keys), weight=1.0)
+            self._metric_w, self._metric_mask = self._init_metric_graph()
+
+    def _ema_update(self, cur: float | None, x: float) -> float:
+        if cur is None:
+            return float(x)
+        d = float(self.lbo_ema_decay)
+        return d * float(cur) + (1.0 - d) * float(x)
+
+    def _init_metric_graph(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        설계변수 키의 의미를 반영한 "구조 그래프"를 만든다.
+
+        - ring처럼 임의 인덱스 이웃을 두지 않고,
+          (i) 같은 유닛 슬롯 내부, (ii) 같은 속성의 양 진영 매칭, (iii) 맵/장애물 그룹
+          위주로 엣지를 둔다.
+        - 반환: (w_init, mask)  (둘 다 (n,n), symmetric, diag=0)
+        """
+        n = int(len(self.optimizable_keys))
+        w = np.zeros((n, n), dtype=np.float32)
+        idx = {k: i for i, k in enumerate(self.optimizable_keys)}
+
+        def connect(a: str, b: str, weight: float = 1.0) -> None:
+            ia = idx.get(a, None)
+            ib = idx.get(b, None)
+            if ia is None or ib is None or ia == ib:
+                return
+            ww = float(max(0.0, weight))
+            if ww <= 0.0:
+                return
+            w[int(ia), int(ib)] = max(float(w[int(ia), int(ib)]), ww)
+            w[int(ib), int(ia)] = max(float(w[int(ib), int(ia)]), ww)
+
+        # 맵/장애물 그룹
+        connect("width", "height", weight=1.0)
+        connect("obstacle_density", "obstacle_pattern", weight=1.0)
+        connect("width", "obstacle_density", weight=0.3)
+        connect("height", "obstacle_density", weight=0.3)
+        connect("width", "obstacle_pattern", weight=0.3)
+        connect("height", "obstacle_pattern", weight=0.3)
+
+        # 유닛 슬롯 내부(팩션별) 결합
+        for prefix in ("p0", "p1"):
+            for ui in range(5):
+                base = f"{prefix}_unit{ui}"
+                k_units = f"{base}_units"
+                k_pat = f"{base}_pattern"
+                k_atk = f"{base}_attack_pattern"
+                k_move = f"{base}_move"
+                k_range = f"{base}_range"
+                k_hp = f"{base}_hp"
+                k_dmg = f"{base}_damage"
+
+                connect(k_units, k_pat, weight=1.0)
+                connect(k_pat, k_atk, weight=1.0)
+                connect(k_move, k_range, weight=0.8)
+                connect(k_hp, k_dmg, weight=0.6)
+
+                # "물량(유닛수)"가 플레이 패턴에 영향을 주는 축으로도 묶어준다.
+                connect(k_units, k_move, weight=0.4)
+                connect(k_units, k_range, weight=0.4)
+                connect(k_units, k_hp, weight=0.4)
+                connect(k_units, k_dmg, weight=0.4)
+
+        # 진영 간 매칭(동일 슬롯/동일 속성은 약결합)
+        for ui in range(5):
+            for suffix in ("units", "pattern", "attack_pattern", "move", "range", "hp", "damage"):
+                connect(f"p0_unit{ui}_{suffix}", f"p1_unit{ui}_{suffix}", weight=0.5)
+
+        # 고립 노드 방지: degree=0이면 width에 약결합(없으면 첫 키에 연결)
+        deg = w.sum(axis=1)
+        anchor = "width" if "width" in idx else self.optimizable_keys[0]
+        for i, d in enumerate(deg.tolist()):
+            if float(d) <= 0.0:
+                connect(self.optimizable_keys[int(i)], anchor, weight=0.2)
+
+        # mask는 "허용 엣지"이고, update_metric에서 affinity를 제한하는 데 쓴다.
+        mask = (w > 0.0).astype(np.float32)
+        np.fill_diagonal(mask, 0.0)
+        np.fill_diagonal(w, 0.0)
+        return w.astype(np.float32), mask.astype(np.float32)
 
     def get_loss(self, stats: Dict) -> float:
         # 다팩션 지원: 모든 팩션 쌍의 승률이 0.5에 가깝도록
@@ -385,6 +471,10 @@ class DesignOptimizer:
             return avg_grad
         if self._metric_w is None:
             return avg_grad
+        if self._metric_mask is None:
+            return avg_grad
+        if self.metric_steps <= 0:
+            return avg_grad
 
         g = np.array([float(avg_grad[k]) for k in self.optimizable_keys], dtype=np.float32)
         # 메트릭 학습은 scale에 민감하므로, magnitude로 1차 정규화한다.
@@ -399,9 +489,12 @@ class DesignOptimizer:
             topk=int(self.metric_topk),
             decay=float(self.metric_decay),
             w_max=float(self.metric_w_max),
+            mask=self._metric_mask,
         )
 
-        g_smooth = g - float(self.metric_beta) * laplacian_mul(self._metric_w, g)
+        g_smooth = g
+        for _ in range(int(self.metric_steps)):
+            g_smooth = g_smooth - float(self.metric_beta) * laplacian_mul(self._metric_w, g_smooth)
         return {k: float(g_smooth[i]) for i, k in enumerate(self.optimizable_keys)}
 
     def _eval_pair(self, design_pos: Dict[str, float], design_neg: Dict[str, float], seed: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -556,7 +649,13 @@ class DesignOptimizer:
             lbo_win = self.get_lbo_curvature(stats_center, stats_pos, stats_neg, eps_norm2=eps_norm2)
             denom = float(self.sigma * self.sigma) * float(max(1e-6, eps_norm2))
             lbo_loss = float(abs((float(loss_pos) + float(loss_neg) - 2.0 * float(loss_center)) / denom))
-            lbo_total = float(lbo_win) + float(self.lbo_loss_weight) * float(lbo_loss)
+
+            # 스케일 자동 정규화(노이즈/환경에 따라 곡률의 절대 스케일이 크게 달라질 수 있음)
+            self._ema_lbo_win = self._ema_update(self._ema_lbo_win, float(lbo_win))
+            self._ema_lbo_loss = self._ema_update(self._ema_lbo_loss, float(lbo_loss))
+            win_norm = float(lbo_win) / float((self._ema_lbo_win or 0.0) + 1e-8)
+            loss_norm = float(lbo_loss) / float((self._ema_lbo_loss or 0.0) + 1e-8)
+            lbo_total = float(win_norm) + float(self.lbo_loss_weight) * float(loss_norm)
             lbo_w = 1.0 / (1.0 + float(lbo_total))
 
             if self.verbose:

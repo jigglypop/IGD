@@ -43,12 +43,14 @@ def update(
     topk: int,
     decay: float,
     w_max: float,
+    mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Hebbian-like metric update (activity-similarity graph learning).
 
     - builds an affinity graph from u
     - sparsifies with top-k
+    - (optional) applies a structural mask to restrict possible edges
     - blends into current w with lr
     - applies decay + clamp
     """
@@ -62,6 +64,16 @@ def update(
         raise ValueError("w_max must be > 0")
 
     a = affinity(u.astype(np.float32), tau=float(tau))
+    if mask is not None:
+        m = np.asarray(mask, dtype=np.float32)
+        if m.ndim != 2 or m.shape[0] != m.shape[1]:
+            raise ValueError("mask must be square (n, n)")
+        if m.shape != w.shape:
+            raise ValueError("mask shape must match w shape")
+        if float(m.min()) < 0.0:
+            raise ValueError("mask must be non-negative")
+        m = _symmetrize(_zero_diag(m))
+        a = (a * m).astype(np.float32, copy=False)
     a = topk_mask(a, k=topk)
     a = _symmetrize(_zero_diag(a))
 

@@ -469,22 +469,94 @@ class GridCombatEnv:
                 if x in banned_cols or mx in banned_cols:
                     curv[int(x), :] = -1e9
 
-            flat = curv.reshape(-1)
-            # 절반만 고르고 좌우 미러링으로 2배를 만든다.
-            pairs = max(1, int(n_total) // 2)
-            pairs = min(int(pairs), int(flat.size))
-            if pairs <= 0:
-                return set()
+            def has_path(obstacles: set) -> bool:
+                # 스폰 컬럼(좌 2열 -> 우 2열) 사이에 통로가 하나도 없으면 "퇴화"로 간주하고 완화한다.
+                mid = int(max_x // 2)
+                start_cols = [max(0, mid - 3), max(0, mid - 2)]
+                goal_cols = [min(max_x - 1, mid + 1), min(max_x - 1, mid + 2)]
+                blocked = set(obstacles)
 
-            idx = np.argpartition(flat, -pairs)[-pairs:]
-            xs, ys = np.unravel_index(idx, curv.shape)
+                goals = {(int(x), int(y)) for x in goal_cols for y in range(max_y) if (int(x), int(y)) not in blocked}
+                if not goals:
+                    return False
+
+                q = []
+                seen = set()
+                for x in start_cols:
+                    for y in range(max_y):
+                        p = (int(x), int(y))
+                        if p in blocked:
+                            continue
+                        q.append(p)
+                        seen.add(p)
+
+                if not q:
+                    return False
+
+                # BFS 4-neighbor
+                head = 0
+                while head < len(q):
+                    x, y = q[head]
+                    head += 1
+                    if (x, y) in goals:
+                        return True
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx = int(x + dx)
+                        ny = int(y + dy)
+                        if not (0 <= nx < max_x and 0 <= ny < max_y):
+                            continue
+                        np_ = (nx, ny)
+                        if np_ in blocked or np_ in seen:
+                            continue
+                        seen.add(np_)
+                        q.append(np_)
+                return False
+
+            def build_with_pairs(pairs: int) -> set:
+                flat = curv.reshape(-1)
+                pairs = max(1, min(int(pairs), int(flat.size)))
+
+                # fold를 "선"처럼 만들기 위해, 상위 후보를 넉넉히 뽑고 세로 방향으로 짧은 세그먼트를 그리며 고른다.
+                budget = min(int(flat.size), int(pairs) * 12)
+                idx = np.argpartition(flat, -budget)[-budget:]
+                idx = idx[np.argsort(flat[idx])[::-1]]
+
+                out_half = set()
+                for ii in idx.tolist():
+                    if len(out_half) >= pairs:
+                        break
+                    x, y = np.unravel_index(int(ii), curv.shape)
+                    x = int(x)
+                    y = int(y)
+                    if float(curv[x, y]) < -1e8:
+                        continue
+
+                    # 이미 바로 근처에 있으면 과밀해지므로 스킵(주름이 너무 점상으로 찢어지는 것 방지)
+                    if (x, y) in out_half or (x, y - 1) in out_half or (x, y + 1) in out_half:
+                        continue
+
+                    for dy in (-1, 0, 1):
+                        if len(out_half) >= pairs:
+                            break
+                        yy = int(y + dy)
+                        if 0 <= yy < max_y:
+                            out_half.add((x, yy))
+
+                out = set()
+                for x, y in out_half:
+                    mx = mirror_x(int(x))
+                    out.add((int(x), int(y)))
+                    out.add((int(mx), int(y)))
+                return out
+
+            # 통로가 막히면, 장애물 수를 단계적으로 줄여서 "수로"가 남도록 한다.
+            base_pairs = max(1, int(n_total) // 2)
             out = set()
-            for x, y in zip(xs.tolist(), ys.tolist()):
-                x = int(x)
-                y = int(y)
-                mx = mirror_x(int(x))
-                out.add((x, y))
-                out.add((int(mx), y))
+            for t in range(6):
+                pairs = max(1, int(float(base_pairs) * (1.0 - 0.12 * float(t))))
+                out = build_with_pairs(pairs)
+                if has_path(out):
+                    return out
             return out
 
         if pattern == 2:
