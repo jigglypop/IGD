@@ -372,6 +372,17 @@ class GridCombatEnv:
                 out.add((int(mx), int(y)))
             return out
 
+        def laplace_2d(z: np.ndarray) -> np.ndarray:
+            """
+            2D 4-neighbor discrete Laplacian (no wrap).  z shape: (w, h)
+            """
+            lap = (-4.0 * z).astype(np.float32, copy=False)
+            lap[1:, :] += z[:-1, :]
+            lap[:-1, :] += z[1:, :]
+            lap[:, 1:] += z[:, :-1]
+            lap[:, :-1] += z[:, 1:]
+            return lap
+
         # pattern 1: 랜덤 대칭 산포(전역)
         def build_pattern_1() -> set:
             half = max_x // 2
@@ -436,10 +447,52 @@ class GridCombatEnv:
                 return build_pattern_1()
             return symmetric_scatter(candidates, n_total)
 
+        # pattern 4: "주름/수로" 느낌의 구조를 만드는 간단한 곡률 기반 패턴
+        # - 랜덤 노이즈를 확산(라플라시안)으로 저주파화
+        # - |라플라시안|이 큰 곳(곡률/경계)을 장애물로 선택
+        # - 좌우 대칭을 유지하고 스폰 컬럼을 피한다
+        def build_pattern_4() -> set:
+            half = max_x // 2
+            if half <= 0:
+                return build_pattern_1()
+
+            z = self.rng.random((half, max_y), dtype=np.float32)
+            diff = 0.25
+            steps = 10
+            for _ in range(int(steps)):
+                z = (z + float(diff) * laplace_2d(z)).astype(np.float32, copy=False)
+
+            curv = np.abs(laplace_2d(z))
+            # banned cols는 점수에서 제외
+            for x in range(half):
+                mx = mirror_x(int(x))
+                if x in banned_cols or mx in banned_cols:
+                    curv[int(x), :] = -1e9
+
+            flat = curv.reshape(-1)
+            # 절반만 고르고 좌우 미러링으로 2배를 만든다.
+            pairs = max(1, int(n_total) // 2)
+            pairs = min(int(pairs), int(flat.size))
+            if pairs <= 0:
+                return set()
+
+            idx = np.argpartition(flat, -pairs)[-pairs:]
+            xs, ys = np.unravel_index(idx, curv.shape)
+            out = set()
+            for x, y in zip(xs.tolist(), ys.tolist()):
+                x = int(x)
+                y = int(y)
+                mx = mirror_x(int(x))
+                out.add((x, y))
+                out.add((int(mx), y))
+            return out
+
         if pattern == 2:
             return build_pattern_2()
         if pattern == 3:
             return build_pattern_3()
+        if pattern == 4:
+            return build_pattern_4()
         return build_pattern_1()
 
     def reset(self, first_turn=None):

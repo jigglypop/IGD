@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from typing import Dict, Any, Tuple, List
 from src.core.simulation import run_simulation, run_simulation_all_pairs
+from src.core.metric import ring as metric_ring, update as update_metric
+from src.core.lbo import laplacian_mul
 
 def wasserstein_distance_1d(u_values, v_values):
     """
@@ -74,6 +76,15 @@ class DesignOptimizer:
         max_workers: int = 0,
         base_seed: int = 42,
         verbose: bool = True,
+        *,
+        lbo_loss_weight: float = 0.05,
+        use_metric_lbo: bool = True,
+        metric_tau: float = 0.35,
+        metric_topk: int = 6,
+        metric_lr: float = 0.25,
+        metric_decay: float = 0.01,
+        metric_w_max: float = 1.0,
+        metric_beta: float = 0.15,
     ):
         self.mean_design = initial_design.copy()
         self.target_dist_mean = target_dist_mean
@@ -85,6 +96,14 @@ class DesignOptimizer:
         self.use_parallel = use_parallel
         self.base_seed = base_seed
         self.verbose = verbose
+        self.lbo_loss_weight = float(lbo_loss_weight)
+        self.use_metric_lbo = bool(use_metric_lbo)
+        self.metric_tau = float(metric_tau)
+        self.metric_topk = int(metric_topk)
+        self.metric_lr = float(metric_lr)
+        self.metric_decay = float(metric_decay)
+        self.metric_w_max = float(metric_w_max)
+        self.metric_beta = float(metric_beta)
 
         if max_workers and max_workers > 0:
             self.max_workers = max_workers
@@ -164,6 +183,13 @@ class DesignOptimizer:
             "p1_unit3_hp",
             "p1_unit4_damage",
         ]
+
+        # (옵션) 설계변수 간 "학습된 메트릭"을 만들고, 그 위에서 라플라시안으로 업데이트를 매끈하게 한다.
+        # - 메트릭은 Hebbian-like rule(metric.update)로 갱신
+        # - 업데이트 벡터(그라디언트)에 diffusion(-L g)을 걸어 "수로처럼" 안정된 방향으로 흐르게 함
+        self._metric_w: np.ndarray | None = None
+        if self.use_metric_lbo and len(self.optimizable_keys) > 2:
+            self._metric_w = metric_ring(len(self.optimizable_keys), weight=1.0)
 
     def get_loss(self, stats: Dict) -> float:
         # 다팩션 지원: 모든 팩션 쌍의 승률이 0.5에 가깝도록
@@ -279,7 +305,7 @@ class DesignOptimizer:
 
         # 장애물(밀도/패턴)
         out["obstacle_density"] = float(max(0.0, min(0.35, float(out.get("obstacle_density", 0.0)))))
-        out["obstacle_pattern"] = int(max(0, min(3, int(round(float(out.get("obstacle_pattern", 0)))))))
+        out["obstacle_pattern"] = int(max(0, min(4, int(round(float(out.get("obstacle_pattern", 0)))))))
 
         # 유닛 수(타입별): unit0~unit4, 0도 허용 (총합 변동 가능)
         for prefix in ("p0", "p1"):
@@ -347,6 +373,36 @@ class DesignOptimizer:
         out["max_steps"] = int(max(60, min(200, int(round(float(out.get("max_steps", 120)))))))
 
         return out
+
+    def _smooth_gradients_with_metric(self, avg_grad: Dict[str, float]) -> Dict[str, float]:
+        """
+        학습된 메트릭 그래프 위에서 ES 그라디언트를 diffusion으로 매끈하게 만든다.
+
+        - g <- g - beta * L g  (L = D - W)
+        - W는 매 step의 g로부터 Hebbian-like 업데이트로 갱신한다.
+        """
+        if not self.use_metric_lbo:
+            return avg_grad
+        if self._metric_w is None:
+            return avg_grad
+
+        g = np.array([float(avg_grad[k]) for k in self.optimizable_keys], dtype=np.float32)
+        # 메트릭 학습은 scale에 민감하므로, magnitude로 1차 정규화한다.
+        scale = float(np.mean(np.abs(g))) if g.size > 0 else 0.0
+        g_for_metric = (g / float(scale + 1e-8)).astype(np.float32, copy=False) if scale > 0 else g
+
+        self._metric_w = update_metric(
+            self._metric_w,
+            g_for_metric,
+            lr=float(self.metric_lr),
+            tau=float(self.metric_tau),
+            topk=int(self.metric_topk),
+            decay=float(self.metric_decay),
+            w_max=float(self.metric_w_max),
+        )
+
+        g_smooth = g - float(self.metric_beta) * laplacian_mul(self._metric_w, g)
+        return {k: float(g_smooth[i]) for i, k in enumerate(self.optimizable_keys)}
 
     def _eval_pair(self, design_pos: Dict[str, float], design_neg: Dict[str, float], seed: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         # 다팩션이면 all_pairs, 아니면 기존 방식
@@ -493,19 +549,23 @@ class DesignOptimizer:
             epsilon = epsilons[int(i)]
             eps_norm2 = float(sum(float(v) * float(v) for v in epsilon.values()))
 
+            loss_center = self.get_loss(stats_center)
             loss_pos = self.get_loss(stats_pos)
             loss_neg = self.get_loss(stats_neg)
 
-            lbo = self.get_lbo_curvature(stats_center, stats_pos, stats_neg, eps_norm2=eps_norm2)
-            lbo_w = 1.0 / (1.0 + 1.0 * float(lbo))
+            lbo_win = self.get_lbo_curvature(stats_center, stats_pos, stats_neg, eps_norm2=eps_norm2)
+            denom = float(self.sigma * self.sigma) * float(max(1e-6, eps_norm2))
+            lbo_loss = float(abs((float(loss_pos) + float(loss_neg) - 2.0 * float(loss_center)) / denom))
+            lbo_total = float(lbo_win) + float(self.lbo_loss_weight) * float(lbo_loss)
+            lbo_w = 1.0 / (1.0 + float(lbo_total))
 
             if self.verbose:
                 print(
-                    f"    Sample {i+1} (+): Loss={loss_pos:.4f} LBO={lbo:.4f} w={lbo_w:.3f} | P0={stats_pos['p0_win_rate']:.2f} "
+                    f"    Sample {i+1} (+): Loss={loss_pos:.4f} LBOw={lbo_win:.4f} LBOL={lbo_loss:.4f} w={lbo_w:.3f} | P0={stats_pos['p0_win_rate']:.2f} "
                     f"P1={stats_pos['p1_win_rate']:.2f} Draw={stats_pos['draw_rate']:.2f} Dist={stats_pos['avg_distance']:.2f}"
                 )
                 print(
-                    f"    Sample {i+1} (-): Loss={loss_neg:.4f} LBO={lbo:.4f} w={lbo_w:.3f} | P0={stats_neg['p0_win_rate']:.2f} "
+                    f"    Sample {i+1} (-): Loss={loss_neg:.4f} LBOw={lbo_win:.4f} LBOL={lbo_loss:.4f} w={lbo_w:.3f} | P0={stats_neg['p0_win_rate']:.2f} "
                     f"P1={stats_neg['p1_win_rate']:.2f} Draw={stats_neg['draw_rate']:.2f} Dist={stats_neg['avg_distance']:.2f}"
                 )
 
@@ -513,7 +573,7 @@ class DesignOptimizer:
             for k in self.optimizable_keys:
                 gradients[k] += float(lbo_w) * diff * float(epsilon[k]) * inv_denom
 
-            results.append((loss_pos, loss_neg, lbo))
+            results.append((loss_pos, loss_neg, lbo_win, lbo_loss))
 
         return gradients, results
 
@@ -527,6 +587,8 @@ class DesignOptimizer:
         # 평균 그라디언트로 업데이트
         denom = float(max(1, int(self.n_samples // 2)))
         avg_grad = {k: float(v) / denom for k, v in gradients.items()}
+
+        avg_grad = self._smooth_gradients_with_metric(avg_grad)
 
         for k in self.optimizable_keys:
             base = float(self.mean_design.get(k, 0.0))

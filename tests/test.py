@@ -53,6 +53,34 @@ class TestPivot(unittest.TestCase):
         for (x, _y) in getattr(env, "obstacles", set()):
             self.assertNotIn(int(x), banned_cols)
 
+    def test_grid_env_obstacles_pattern4_respect_spawn_columns(self):
+        design = {
+            "n_factions": 2,
+            "width": 12,
+            "height": 12,
+            "obstacle_density": 0.25,
+            "obstacle_pattern": 4,
+            "max_steps": 30,
+            "no_attack_limit": 15,
+            "shaping_scale": 0.0,
+            # 작은 테스트용 편성(king은 자동 1)
+            "p0_unit0_units": 1,
+            "p0_unit1_units": 0,
+            "p0_unit2_units": 0,
+            "p0_unit3_units": 0,
+            "p0_unit4_units": 0,
+            "p1_unit0_units": 1,
+            "p1_unit1_units": 0,
+            "p1_unit2_units": 0,
+            "p1_unit3_units": 0,
+            "p1_unit4_units": 0,
+        }
+        env = GridCombatEnv(design, seed=0, factions=(0, 1))
+        env.reset(first_turn=0)
+        banned_cols = env._spawn_columns()
+        for (x, _y) in getattr(env, "obstacles", set()):
+            self.assertNotIn(int(x), banned_cols)
+
     def test_grid_env_step_smoke(self):
         design = {
             "n_factions": 2,
@@ -125,7 +153,7 @@ class TestPivot(unittest.TestCase):
         self.assertGreaterEqual(float(clamped["obstacle_density"]), 0.0)
         self.assertLessEqual(float(clamped["obstacle_density"]), 0.35)
         self.assertGreaterEqual(int(clamped["obstacle_pattern"]), 0)
-        self.assertLessEqual(int(clamped["obstacle_pattern"]), 3)
+        self.assertLessEqual(int(clamped["obstacle_pattern"]), 4)
         self.assertGreaterEqual(int(clamped["p0_unit0_units"]), 0)
         self.assertLessEqual(int(clamped["p0_unit0_units"]), 8)
         self.assertGreaterEqual(int(clamped["p1_unit0_units"]), 0)
